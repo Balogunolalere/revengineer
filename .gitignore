@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+
+# Debug / temp artifacts
+debug_search_dump.json
+debug_search_sse.py
+
+# Browser profile (grab_token.py persistence)
+# ~/.deepseek_browser_profile is outside repo, no action needed
+
+# Token files (NEVER commit secrets)
+*.token

@@ -1,0 +1,16 @@
+[project]
+name = "revengineer"
+version = "0.1.0"
+description = "Reverse-engineered DeepSeek terminal client & OpenAI-compatible API proxy"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32",
+    "httpx>=0.27",
+    "fastapi[standard]>=0.115",
+    "pydantic>=2.10",
+    "playwright>=1.49",
+]
+
+[project.scripts]
+deepseek-cli = "deepseek_cli:main"
+deepseek-api = "deepseek_api:start"

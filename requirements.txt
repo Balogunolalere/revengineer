@@ -1,0 +1,11 @@
+# Core
+requests>=2.32
+httpx>=0.27
+
+# API server
+fastapi[standard]>=0.115
+pydantic>=2.10
+uvicorn>=0.34
+
+# Browser-based token grabber (optional — only needed for grab_token.py)
+playwright>=1.49
