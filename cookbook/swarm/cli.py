@@ -24,10 +24,6 @@ Environment variables (optional):
 import argparse
 import asyncio
 import sys
-import os
-
-# Allow running from project root
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from cookbook.swarm import Swarm, SwarmConfig, SwarmMode
 

@@ -640,7 +640,7 @@ class TestOrchestrator(unittest.TestCase):
 
         # Mock _chat to return a plan with only 1 agent
         async def mock_chat(messages, model="", temperature=None,
-                            max_tokens=None, is_orchestrator=False):
+                            max_tokens=None, is_orchestrator=False, **kwargs):
             return json.dumps({
                 "strategy": "single agent",
                 "agents": [{"role": "Solo", "task": "do it all"}]
@@ -665,7 +665,7 @@ class TestOrchestrator(unittest.TestCase):
         )
 
         async def mock_chat(messages, model="", temperature=None,
-                            max_tokens=None, is_orchestrator=False):
+                            max_tokens=None, is_orchestrator=False, **kwargs):
             return json.dumps({
                 "strategy": "too many agents",
                 "agents": [
@@ -819,7 +819,7 @@ class TestSwarmOneLiner(unittest.TestCase):
 
         # Mock the Orchestrator's _chat to return canned results
         async def mock_chat(messages, model="", temperature=None,
-                            max_tokens=None, is_orchestrator=False):
+                            max_tokens=None, is_orchestrator=False, **kwargs):
             content = messages[-1]["content"]
             if "Original Goal" in content:
                 return "Synthesized final report."
@@ -995,6 +995,150 @@ class TestSwarmMode(unittest.TestCase):
         self.assertEqual(SwarmMode.AUTO.value, "auto")
         self.assertEqual(SwarmMode.MANUAL.value, "manual")
         self.assertEqual(SwarmMode.ITERATIVE.value, "iterative")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Auto-continuation tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestAutoContinuation(unittest.TestCase):
+    """Test the auto_continue logic in _chat for handling truncated responses."""
+
+    def test_single_response_no_truncation(self):
+        """Normal response (finish_reason='stop') returns content directly."""
+        config = SwarmConfig(api_base="http://localhost:9999/v1")
+
+        call_count = 0
+
+        async def mock_post(path, json=None):
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "choices": [{
+                    "message": {"content": "Complete response."},
+                    "finish_reason": "stop",
+                }]
+            }
+            return resp
+
+        async def run():
+            async with Orchestrator(config) as orc:
+                orc._client.post = mock_post
+                result = await orc._chat(
+                    messages=[{"role": "user", "content": "hello"}],
+                    auto_continue=True,
+                )
+            self.assertEqual(result, "Complete response.")
+            self.assertEqual(call_count, 1)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_truncated_response_continues(self):
+        """Truncated response (finish_reason='length') triggers continuation."""
+        config = SwarmConfig(api_base="http://localhost:9999/v1")
+
+        call_count = 0
+
+        async def mock_post(path, json=None):
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            if call_count == 1:
+                # First call — truncated
+                resp.json.return_value = {
+                    "choices": [{
+                        "message": {"content": "Part one of the report. "},
+                        "finish_reason": "length",
+                    }]
+                }
+            else:
+                # Continuation — complete
+                resp.json.return_value = {
+                    "choices": [{
+                        "message": {"content": "Part two completes it."},
+                        "finish_reason": "stop",
+                    }]
+                }
+            return resp
+
+        async def run():
+            async with Orchestrator(config) as orc:
+                orc._client.post = mock_post
+                result = await orc._chat(
+                    messages=[{"role": "user", "content": "write report"}],
+                    auto_continue=True,
+                )
+            self.assertEqual(result, "Part one of the report. Part two completes it.")
+            self.assertEqual(call_count, 2)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_auto_continue_disabled_no_continuation(self):
+        """auto_continue=False doesn't attempt continuation even on truncation."""
+        config = SwarmConfig(api_base="http://localhost:9999/v1")
+
+        call_count = 0
+
+        async def mock_post(path, json=None):
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "choices": [{
+                    "message": {"content": "Truncated output"},
+                    "finish_reason": "length",
+                }]
+            }
+            return resp
+
+        async def run():
+            async with Orchestrator(config) as orc:
+                orc._client.post = mock_post
+                result = await orc._chat(
+                    messages=[{"role": "user", "content": "hello"}],
+                    auto_continue=False,
+                )
+            self.assertEqual(result, "Truncated output")
+            self.assertEqual(call_count, 1)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_max_continuations_respected(self):
+        """Continuation stops after max_continuations even if still truncated."""
+        config = SwarmConfig(api_base="http://localhost:9999/v1")
+
+        call_count = 0
+
+        async def mock_post(path, json=None):
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "choices": [{
+                    "message": {"content": f"chunk{call_count} "},
+                    "finish_reason": "length",
+                }]
+            }
+            return resp
+
+        async def run():
+            async with Orchestrator(config) as orc:
+                orc._client.post = mock_post
+                result = await orc._chat(
+                    messages=[{"role": "user", "content": "hello"}],
+                    auto_continue=True,
+                    max_continuations=2,
+                )
+            # 1 initial + 2 continuations = 3 total
+            self.assertEqual(call_count, 3)
+            self.assertEqual(result, "chunk1 chunk2 chunk3 ")
+
+        asyncio.new_event_loop().run_until_complete(run())
 
 
 if __name__ == "__main__":

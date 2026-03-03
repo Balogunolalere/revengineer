@@ -2,8 +2,8 @@
 Live terminal renderer and file output for swarm execution.
 
 Features:
-- Real-time agent status display with colors
-- Progress tracking
+- Real-time agent status display with colors and spinner animation
+- Progress tracking with live agent status board
 - Final report formatting
 - Markdown and JSON file output
 """
@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
+import threading
 import time
 from datetime import datetime
 from typing import TextIO
@@ -20,6 +22,10 @@ from typing import TextIO
 from .models import (
     AgentSpec, AgentResult, AgentStatus, SwarmPlan, SwarmResult,
 )
+
+# Spinner frames — smooth Braille animation
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+PULSE_FRAMES = ["◐", "◓", "◑", "◒"]
 
 # ANSI colors
 DIM = "\033[2m"
@@ -55,6 +61,11 @@ class SwarmRenderer:
         self._agent_status: dict[str, AgentStatus] = {}
         self._agent_roles: dict[str, str] = {}
         self._log_lines: list[str] = []
+        # Spinner state
+        self._spinner_thread: threading.Thread | None = None
+        self._spinner_stop = threading.Event()
+        self._spinner_lock = threading.Lock()
+        self._running_agents: dict[str, float] = {}  # agent_id → start_time
 
     def _elapsed(self) -> str:
         e = time.time() - self._start_time
@@ -65,8 +76,56 @@ class SwarmRenderer:
 
     def _print(self, msg: str):
         if self.stream:
-            print(msg, flush=True)
+            with self._spinner_lock:
+                self._clear_spinner_line()
+                print(msg, flush=True)
         self._log_lines.append(_strip_ansi(msg))
+
+    def _clear_spinner_line(self):
+        """Clear the current spinner line (if any)."""
+        if self.stream and self._spinner_thread and self._spinner_thread.is_alive():
+            sys.stdout.write(f"\r\033[K")
+            sys.stdout.flush()
+
+    def _spinner_loop(self):
+        """Background spinner showing active agents."""
+        frame_idx = 0
+        while not self._spinner_stop.is_set():
+            with self._spinner_lock:
+                running = dict(self._running_agents)
+            if running and self.stream:
+                frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
+                names = []
+                now = time.time()
+                for aid, start in running.items():
+                    role = self._agent_roles.get(aid, "agent")
+                    elapsed = now - start
+                    names.append(f"{role} {DIM}{elapsed:.0f}s{RESET}")
+                status_str = f"  {CYAN}{frame}{RESET} {DIM}Working:{RESET} {' · '.join(names)}"
+                with self._spinner_lock:
+                    sys.stdout.write(f"\r\033[K{status_str}")
+                    sys.stdout.flush()
+            frame_idx += 1
+            self._spinner_stop.wait(0.1)  # ~10 FPS
+        # Clear on exit
+        if self.stream:
+            sys.stdout.write(f"\r\033[K")
+            sys.stdout.flush()
+
+    def _start_spinner(self):
+        """Start the background spinner thread."""
+        if not self.stream:
+            return
+        self._spinner_stop.clear()
+        self._spinner_thread = threading.Thread(target=self._spinner_loop, daemon=True)
+        self._spinner_thread.start()
+
+    def _stop_spinner(self):
+        """Stop the background spinner thread."""
+        self._spinner_stop.set()
+        if self._spinner_thread:
+            self._spinner_thread.join(timeout=1.0)
+            self._spinner_thread = None
 
     # ----- Event handlers (called by engine) -----
 
@@ -96,9 +155,12 @@ class SwarmRenderer:
             self._agent_roles[agent.agent_id] = agent.role
 
         self._print(f"\n{DIM}{'─' * 50}{RESET}")
+        # Start the spinner now that agents are about to run
+        self._start_spinner()
 
     def on_agent_start(self, agent: AgentSpec):
         self._agent_status[agent.agent_id] = AgentStatus.RUNNING
+        self._running_agents[agent.agent_id] = time.time()
         icon = STATUS_ICONS[AgentStatus.RUNNING]
         self._print(
             f"  {icon} {BOLD}{agent.role}{RESET} "
@@ -107,6 +169,7 @@ class SwarmRenderer:
 
     def on_agent_done(self, result: AgentResult):
         self._agent_status[result.agent_id] = result.status
+        self._running_agents.pop(result.agent_id, None)
         if result.status == AgentStatus.COMPLETED:
             icon = STATUS_ICONS[AgentStatus.COMPLETED]
             content_preview = result.content[:80].replace("\n", " ")
@@ -133,10 +196,17 @@ class SwarmRenderer:
         )
 
     def on_synthesis_start(self):
+        self._stop_spinner()
         self._print(f"\n{DIM}{'─' * 50}{RESET}")
         self._print(f"  {CYAN}⟳{RESET} {BOLD}Synthesizing results...{RESET}")
+        # Start a synthesis spinner
+        self._running_agents["__synthesis__"] = time.time()
+        self._agent_roles["__synthesis__"] = "Synthesis"
+        self._start_spinner()
 
     def on_complete(self, result: SwarmResult):
+        self._running_agents.pop("__synthesis__", None)
+        self._stop_spinner()
         succeeded = len(result.successful)
         failed = len(result.failed)
         total = len(result.agent_results)

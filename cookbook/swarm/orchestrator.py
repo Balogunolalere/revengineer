@@ -144,8 +144,14 @@ class Orchestrator:
         temperature: float | None = None,
         max_tokens: int | None = None,
         is_orchestrator: bool = False,
+        auto_continue: bool = False,
+        max_continuations: int = 3,
     ) -> str:
-        """Send a chat completion request with retry on server errors."""
+        """Send a chat completion request with retry on server errors.
+
+        If auto_continue=True, detects truncated responses (finish_reason='length')
+        and automatically sends follow-up requests to get the complete output.
+        """
         if is_orchestrator and self.config.orchestrator_model:
             effective_model = self.config.orchestrator_model
         else:
@@ -153,26 +159,47 @@ class Orchestrator:
 
         payload = {
             "model": effective_model,
-            "messages": messages,
+            "messages": list(messages),  # copy so we can extend for continuations
             "temperature": temperature if temperature is not None else self.config.temperature,
             "stream": False,
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
 
-        last_error = None
-        for attempt in range(3):
-            try:
-                resp = await self.client.post("/chat/completions", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-                return data["choices"][0]["message"]["content"]
-            except Exception as e:
-                last_error = e
-                if attempt < 2:
-                    import asyncio
-                    await asyncio.sleep(2 ** attempt)
-        raise last_error  # type: ignore[misc]
+        full_content = ""
+
+        for continuation in range(max_continuations + 1):
+            last_error = None
+            for attempt in range(3):
+                try:
+                    resp = await self.client.post("/chat/completions", json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < 2:
+                        import asyncio
+                        await asyncio.sleep(2 ** attempt)
+            else:
+                raise last_error  # type: ignore[misc]
+
+            chunk = data["choices"][0]["message"]["content"]
+            finish_reason = data["choices"][0].get("finish_reason", "stop")
+            full_content += chunk
+
+            # If not truncated or auto_continue disabled, we're done
+            if not auto_continue or finish_reason != "length":
+                break
+
+            # Truncated — send a continuation request
+            # Append the assistant's partial response and ask to continue
+            payload["messages"] = list(messages) + [
+                {"role": "assistant", "content": full_content},
+                {"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already written."},
+            ]
+
+        return full_content
 
     # ----- Decomposition -----
 
@@ -338,6 +365,8 @@ class Orchestrator:
             max_tokens=self.config.max_tokens * 2,  # synthesis can be longer
             temperature=0.3,  # coherent synthesis
             is_orchestrator=True,
+            auto_continue=True,  # auto-continue if synthesis gets truncated
+            max_continuations=3,
         )
 
     # ----- Full swarm run -----
@@ -350,6 +379,7 @@ class Orchestrator:
         on_start=None,
         on_done=None,
         on_retry=None,
+        on_synthesis_start=None,
     ) -> SwarmResult:
         """Full swarm execution: decompose → execute → [re-plan →] synthesize."""
         swarm_start = time.time()
@@ -403,6 +433,9 @@ class Orchestrator:
                 plan.agents.extend(new_agents)
 
         # Step 3: Synthesize
+        if on_synthesis_start:
+            from .engine import _maybe_await
+            _maybe_await(on_synthesis_start())
         synthesis = await self.synthesize(goal, agent_results)
 
         return SwarmResult(

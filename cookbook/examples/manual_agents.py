@@ -10,15 +10,11 @@ This gives you full control over:
 - Which model each agent uses
 
 Prerequisites:
-    1. Start your DeepSeek API proxy:  python deepseek_api.py
-    2. Run this script:                python cookbook/examples/manual_agents.py
+    1. Start your DeepSeek API proxy:  uv run python deepseek_api.py
+    2. Run this script:                uv run python cookbook/examples/manual_agents.py
 """
 
 import asyncio
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from cookbook.swarm import (
     Swarm, SwarmConfig, SwarmMode,

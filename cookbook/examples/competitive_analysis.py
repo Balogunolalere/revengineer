@@ -4,15 +4,11 @@ Example: Competitive analysis swarm — research multiple companies
 in parallel, then synthesize into a strategic report.
 
 Prerequisites:
-    1. Start your DeepSeek API proxy:  python deepseek_api.py
-    2. Run this script:                python cookbook/examples/competitive_analysis.py
+    1. Start your DeepSeek API proxy:  uv run python deepseek_api.py
+    2. Run this script:                uv run python cookbook/examples/competitive_analysis.py
 """
 
 import asyncio
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from cookbook.swarm import Swarm, SwarmConfig
 

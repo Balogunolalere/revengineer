@@ -4,15 +4,11 @@ Example: Code review swarm — multiple specialized reviewers
 analyze code in parallel, then a lead produces a unified report.
 
 Prerequisites:
-    1. Start your DeepSeek API proxy:  python deepseek_api.py
-    2. Run this script:                python cookbook/examples/code_review.py
+    1. Start your DeepSeek API proxy:  uv run python deepseek_api.py
+    2. Run this script:                uv run python cookbook/examples/code_review.py
 """
 
 import asyncio
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from cookbook.swarm import (
     Swarm, SwarmConfig, SwarmMode,

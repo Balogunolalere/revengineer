@@ -6,6 +6,44 @@ A production-quality parallel AI agent orchestration system. Decomposes complex 
 
 ---
 
+## Setup
+
+### Prerequisites
+
+- **Python 3.12+**
+- **[uv](https://docs.astral.sh/uv/)** — fast Python package manager
+- **An OpenAI-compatible API endpoint** (e.g., the `deepseek_api.py` proxy, OpenAI, ollama, vLLM, etc.)
+
+### Install with uv
+
+```bash
+# Clone the project (if you haven't already)
+git clone https://github.com/YOUR_USER/revengineer.git
+cd revengineer
+
+# Install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create venv and install all dependencies in one step
+uv sync
+
+# Start the DeepSeek API proxy (needed as the LLM backend)
+uv run python deepseek_api.py
+```
+
+> **First time?** You'll need a DeepSeek token. See the [root README](../README.md#-quick-start) for authentication options.
+
+### Verify it works
+
+```bash
+# In a second terminal — run the basic example
+uv run python cookbook/examples/basic_research.py
+```
+
+You should see the swarm activate, agents spin up with a live spinner, and a final report synthesized.
+
+---
+
 ## Architecture
 
 ```
@@ -28,11 +66,11 @@ A production-quality parallel AI agent orchestration system. Decomposes complex 
               └─────┬─────┘────────────┘
                     │
              ┌──────▼───────┐
-             │  Synthesizer  │  ← combines all outputs
+             │  Synthesizer  │  ← combines all outputs (auto-continues on truncation)
              └──────┬───────┘
                     │
              ┌──────▼───────┐
-             │   Renderer    │  ← terminal + file output
+             │   Renderer    │  ← live spinner animation + file output
              └──────────────┘
 ```
 
@@ -43,8 +81,8 @@ A production-quality parallel AI agent orchestration system. Decomposes complex 
 | `models.py` | `AgentSpec`, `AgentResult`, `SwarmPlan`, `SwarmResult` with DAG validation + cycle detection |
 | `config.py` | `SwarmConfig` — all settings with `SWARM_*` env var support |
 | `engine.py` | `SwarmEngine` — concurrent execution with token-bucket rate limiting, DAG dependency resolution, retries with exponential backoff + jitter, per-agent timeouts |
-| `orchestrator.py` | `Orchestrator` — LLM-powered decomposition, agent running with shared context, synthesis, iterative re-planning |
-| `renderer.py` | `SwarmRenderer` — live ANSI terminal display + markdown/JSON file output |
+| `orchestrator.py` | `Orchestrator` — LLM-powered decomposition, agent running with shared context, synthesis with auto-continuation, iterative re-planning |
+| `renderer.py` | `SwarmRenderer` — live Braille spinner animation, ANSI status display, markdown/JSON file output |
 | `cli.py` | CLI entry point with argparse |
 | `__init__.py` | Public API — `Swarm()` one-liner |
 
@@ -65,17 +103,17 @@ print(result.synthesis)
 ### CLI
 
 ```bash
-# Using your DeepSeek proxy (start it first: python deepseek_api.py)
-python -m cookbook.swarm "compare Python vs Rust for backend development"
+# Using your DeepSeek proxy (start it first: uv run python deepseek_api.py)
+uv run python -m cookbook.swarm "compare Python vs Rust for backend development"
 
 # With options
-python -m cookbook.swarm --agents 10 --verbose "research the best open-source LLMs"
+uv run python -m cookbook.swarm --agents 10 --verbose "research the best open-source LLMs"
 
 # Using any OpenAI-compatible endpoint
-python -m cookbook.swarm --api-base https://api.openai.com/v1 --api-key sk-... "your task"
+uv run python -m cookbook.swarm --api-base https://api.openai.com/v1 --api-key sk-... "your task"
 
 # Iterative mode (re-plans to fill gaps)
-python -m cookbook.swarm --mode iterative "deep dive into WebAssembly's future"
+uv run python -m cookbook.swarm --mode iterative "deep dive into WebAssembly's future"
 ```
 
 ---
@@ -127,6 +165,7 @@ config = SwarmConfig(
     max_agents=20,
     agent_timeout=120,
     output_dir="./reports",
+    verbose=True,
 )
 ```
 
@@ -157,15 +196,56 @@ All settings can be set via `SWARM_*` environment variables:
 
 ## Examples
 
-See the [`examples/`](../examples/) directory:
+See the [`examples/`](examples/) directory:
 
-| Example | Description |
-|---------|-------------|
-| `basic_research.py` | Simple AUTO mode — one-liner research swarm |
-| `manual_agents.py` | MANUAL mode — custom agents with dependency DAG |
-| `code_review.py` | 4 specialist reviewers → 1 lead reviewer (DAG) |
-| `competitive_analysis.py` | AUTO mode with search-enabled agents |
-| `iterative_dive.py` | ITERATIVE mode — 2-round deep dive with gap-filling |
+| Example | Mode | Description |
+|---------|------|-------------|
+| `basic_research.py` | AUTO | Simple one-liner research swarm |
+| `manual_agents.py` | MANUAL | Custom agents with dependency DAG |
+| `code_review.py` | MANUAL | 4 specialist reviewers → 1 lead reviewer (DAG) |
+| `competitive_analysis.py` | AUTO | Search-enabled competitive research |
+| `iterative_dive.py` | ITERATIVE | 2-round deep dive with gap-filling |
+
+Run any example:
+```bash
+uv run python cookbook/examples/basic_research.py
+```
+
+---
+
+## Features
+
+### Live Spinner Animation
+
+While agents are working, a live Braille spinner shows which agents are running and for how long:
+
+```
+  ● Security Researcher started [0.2s]
+  ● Trend Analyst started [0.3s]
+  ⠹ Working: Security Researcher 12s · Trend Analyst 8s     ← live spinner
+  ✓ Trend Analyst done in 14.2s [14.5s]
+  ✓ Security Researcher done in 18.7s [18.9s]
+  ⟳ Synthesizing results...
+  ⠙ Working: Synthesis 5s                                    ← spins during synthesis too
+```
+
+### Auto-Continuation
+
+When the LLM's synthesis output gets truncated (hitting `max_tokens`), the swarm automatically sends follow-up requests to get the complete report — up to 3 continuations, producing up to ~32K tokens of synthesis output. No more "Continue" buttons.
+
+### Verbose Mode
+
+Use `--verbose` or `verbose=True` to see:
+- **Content preview** — first 80 chars of each agent's output as they complete
+- **Agent breakdown** — individual timings, character counts, and retry attempts at the end
+
+### Output Files
+
+Results are saved to `output_dir` (default: current directory) as:
+- `swarm_{slug}_{timestamp}.md` — polished markdown report
+- `swarm_{slug}_{timestamp}.json` — machine-readable structured data
+
+Disable with `--no-save` or `save=False`.
 
 ---
 
@@ -207,7 +287,8 @@ errors = plan.validate()  # Returns ["Circular dependency detected"] if applicab
 | Retries | ❌ None | ❌ Broken jitter (`hash%1=0`) | ✅ Exponential backoff + real jitter |
 | Shared context | ❌ Isolated | ❌ No | ✅ Dependency outputs + peer summaries |
 | Backend | Kimi API only | OpenAI only | ✅ Any OpenAI-compatible endpoint |
-| Terminal output | ❌ None | ❌ Basic print | ✅ Live ANSI streaming with status icons |
+| Terminal output | ❌ None | ❌ Basic print | ✅ Live spinner + ANSI status icons |
+| Truncation | ❌ Manual "Continue" | ❌ Truncated | ✅ Auto-continuation (up to 3 rounds) |
 | File output | ❌ None | ❌ No | ✅ Markdown + JSON reports |
 | Cycle detection | ❌ No | ❌ No | ✅ DFS validation |
 | Per-agent timeout | ❌ No | ❌ No | ✅ `asyncio.wait_for` |
@@ -216,9 +297,7 @@ errors = plan.validate()  # Returns ["Circular dependency detected"] if applicab
 
 ---
 
-## Output
-
-### Terminal (live streaming)
+## Terminal Output
 
 ```
 ╔══════════════════════════════════════════════╗
@@ -241,27 +320,27 @@ Agent Lineup:
   ● Ecosystem Analyst started [0.2s]
   ● Developer Experience Reviewer started [0.3s]
   ● Production Deployment Expert started [0.3s]
+  ⠹ Working: Performance Benchmarker 5s · Ecosystem Analyst 5s · ...
   ✓ Ecosystem Analyst done in 8.2s [8.4s]
   ✓ Performance Benchmarker done in 12.1s [12.2s]
   ✓ Developer Experience Reviewer done in 9.8s [10.1s]
   ✓ Production Deployment Expert done in 11.4s [11.5s]
   ● Strategic Advisor started [12.3s]
+  ⠙ Working: Strategic Advisor 8s
   ✓ Strategic Advisor done in 15.2s [27.5s]
 
 ──────────────────────────────────────────────────
   ⟳ Synthesizing results...
+  ⠋ Working: Synthesis 12s
 
 ╔══════════════════════════════════════════════╗
 ║  ✓ SWARM COMPLETE                            ║
 ╚══════════════════════════════════════════════╝
   Agents: 5/5 succeeded
-  Duration: 35.2s
+  Duration: 45.2s
+  📄 Report saved: ./swarm_compare_python_vs_rust_20260303_141523.md
+  📊 JSON saved: ./swarm_compare_python_vs_rust_20260303_141523.json
 ```
-
-### File Output
-
-- **Markdown** (`swarm_<slug>_<timestamp>.md`) — polished report with goal, strategy, synthesis, and individual agent outputs
-- **JSON** (`swarm_<slug>_<timestamp>.json`) — machine-readable `SwarmResult` with all metadata
 
 ---
 
@@ -277,11 +356,11 @@ config = SwarmConfig(api_base="http://localhost:8000/v1")
 async with Orchestrator(config) as orc:
     # Manual decomposition
     plan = await orc.decompose("your complex task")
-    
+
     # Inspect the plan
     for agent in plan.agents:
         print(f"{agent.role}: {agent.task[:60]}...")
-    
+
     # Execute with custom callbacks
     engine = SwarmEngine(
         config=config,
@@ -290,7 +369,7 @@ async with Orchestrator(config) as orc:
         on_done=lambda r: print(f"Done: {r.role} ({r.duration:.1f}s)"),
     )
     results = await engine.execute(plan)
-    
+
     # Custom synthesis
     report = await orc.synthesize(plan.goal, results)
 ```
@@ -319,13 +398,30 @@ config = SwarmConfig(
 
 ---
 
+## Testing
+
+Run the full test suite (64 tests):
+
+```bash
+uv run python -m pytest cookbook/tests/test_swarm.py -v
+```
+
+Tests cover: models, config, engine (DAG resolution, retries, timeouts, concurrency), orchestrator (decomposition, min/max agents), renderer, auto-continuation, and edge cases.
+
+---
+
 ## Requirements
 
-- Python 3.11+
+- Python 3.12+
 - `httpx` — async HTTP client
-- An OpenAI-compatible API endpoint (e.g., `deepseek_api.py` proxy, OpenAI, ollama, vLLM, etc.)
+- An OpenAI-compatible API endpoint
 
-Install:
+Install with uv (handles everything):
+```bash
+uv sync
+```
+
+Or install manually:
 ```bash
 pip install httpx
 ```

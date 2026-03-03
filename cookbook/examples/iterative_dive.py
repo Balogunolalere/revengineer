@@ -5,15 +5,11 @@ the orchestrator reviews the first round's output, identifies gaps,
 and spawns additional agents to fill them.
 
 Prerequisites:
-    1. Start your DeepSeek API proxy:  python deepseek_api.py
-    2. Run this script:                python cookbook/examples/iterative_dive.py
+    1. Start your DeepSeek API proxy:  uv run python deepseek_api.py
+    2. Run this script:                uv run python cookbook/examples/iterative_dive.py
 """
 
 import asyncio
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from cookbook.swarm import Swarm, SwarmConfig, SwarmMode
 
@@ -42,7 +38,7 @@ async def main():
     )
 
     print(f"\n{'='*60}")
-    print(f"Total time: {result.total_time:.1f}s")
+    print(f"Total time: {result.duration:.1f}s")
     print(f"Agents used: {len(result.agent_results)}")
     print(f"\n{result.synthesis}")
 

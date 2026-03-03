@@ -65,7 +65,7 @@ async def Swarm(
             plan = await orc.decompose(goal, mode)
         renderer.on_plan_ready(plan)
 
-        # Show synthesis messaging before running (synthesis happens inside orc.run)
+        # Run agents + synthesize (synthesis_start callback fires inside orc.run)
         result = await orc.run(
             goal=goal,
             mode=mode,
@@ -73,9 +73,9 @@ async def Swarm(
             on_start=renderer.on_agent_start,
             on_done=renderer.on_agent_done,
             on_retry=renderer.on_agent_retry,
+            on_synthesis_start=renderer.on_synthesis_start,
         )
 
-        renderer.on_synthesis_start()
         renderer.on_complete(result)
 
         # Save output files

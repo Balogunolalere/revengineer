@@ -6,15 +6,11 @@ This spawns multiple specialized agents in parallel, each tackling
 a different aspect of the research, then synthesizes a final report.
 
 Prerequisites:
-    1. Start your DeepSeek API proxy:  python deepseek_api.py
-    2. Run this script:                python cookbook/examples/basic_research.py
+    1. Start your DeepSeek API proxy:  uv run python deepseek_api.py
+    2. Run this script:                uv run python cookbook/examples/basic_research.py
 """
 
 import asyncio
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from cookbook.swarm import Swarm, SwarmConfig
 

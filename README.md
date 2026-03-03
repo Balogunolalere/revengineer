@@ -32,7 +32,8 @@ git clone https://github.com/YOUR_USER/revengineer.git
 cd revengineer
 
 # Using uv (recommended)
-uv sync
+curl -LsSf https://astral.sh/uv/install.sh | sh  # install uv if needed
+uv sync                                           # creates venv + installs deps
 
 # Or using pip
 pip install -r requirements.txt
@@ -97,7 +98,7 @@ DEEPSEEK_PASSWORD=yourpass
 ### 3. Chat!
 
 ```bash
-python deepseek_cli.py
+uv run python deepseek_cli.py
 ```
 
 ```
@@ -114,10 +115,10 @@ DeepSeek: The mass of the Sun is approximately 1.989 × 10³⁰ kg ...
 ## 💬 CLI Usage
 
 ```bash
-python deepseek_cli.py                  # default (thinking + search ON)
-python deepseek_cli.py --no-think       # disable thinking (faster responses)
-python deepseek_cli.py --no-search      # disable web search
-python deepseek_cli.py --token TOKEN    # use a specific token
+uv run python deepseek_cli.py                  # default (thinking + search ON)
+uv run python deepseek_cli.py --no-think       # disable thinking (faster responses)
+uv run python deepseek_cli.py --no-search      # disable web search
+uv run python deepseek_cli.py --token TOKEN    # use a specific token
 ```
 
 **In-chat commands:**
@@ -155,9 +156,9 @@ Drop-in replacement for OpenAI's API. Works with **Continue**, **Cursor**, **aid
 ### Start the server
 
 ```bash
-python deepseek_api.py                          # default: port 8000
-python deepseek_api.py --port 8080              # custom port
-python deepseek_api.py --host 127.0.0.1         # localhost only
+uv run python deepseek_api.py                          # default: port 8000
+uv run python deepseek_api.py --port 8080              # custom port
+uv run python deepseek_api.py --host 127.0.0.1         # localhost only
 ```
 
 ### Use with OpenAI SDK
@@ -227,13 +228,13 @@ All config can be set via `.env` file or exported in your shell:
 
 ```bash
 # 50 requests, 3 concurrent workers
-python stress_test.py --total 50 --concurrent 3
+uv run python stress_test.py --total 50 --concurrent 3
 
 # Burst test: 10 simultaneous requests
-python stress_test.py --burst 10
+uv run python stress_test.py --burst 10
 
 # Duration test: run for 60 seconds
-python stress_test.py --duration 60
+uv run python stress_test.py --duration 60
 ```
 
 > **Known rate limit**: ~76 requests at 3 concurrent before HTTP 202 block.
@@ -310,6 +311,16 @@ revengineer/
 ├── pow_solver.js         # Fast Node.js PoW solver
 ├── grab_token.py         # Playwright browser token grabber
 ├── stress_test.py        # Load testing tool
+├── cookbook/
+│   ├── swarm/            # 🐝 Parallel agent orchestration system
+│   │   ├── models.py     # Data models with DAG validation
+│   │   ├── config.py     # SwarmConfig with SWARM_* env vars
+│   │   ├── engine.py     # Concurrent execution engine
+│   │   ├── orchestrator.py  # LLM decomposition + synthesis
+│   │   ├── renderer.py   # Live spinner + terminal output
+│   │   └── cli.py        # CLI entry point
+│   ├── examples/         # Ready-to-run example scripts
+│   └── tests/            # 64 unit tests
 ├── pyproject.toml        # uv project config
 ├── requirements.txt      # pip dependencies
 ├── .env                  # Your secrets (git-ignored)
