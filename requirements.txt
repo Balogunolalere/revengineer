@@ -8,4 +8,4 @@ pydantic>=2.10
 uvicorn>=0.34
 
 # Browser-based token grabber (optional — only needed for grab_token.py)
-playwright>=1.49
+#playwright>=1.49
