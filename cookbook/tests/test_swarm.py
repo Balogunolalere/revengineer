@@ -51,7 +51,7 @@ class TestAgentSpec(unittest.TestCase):
         self.assertEqual(a.depends_on, [])
         self.assertEqual(a.tools, [])
         self.assertEqual(a.priority, 0)
-        self.assertEqual(a.timeout, 120.0)
+        self.assertIsNone(a.timeout)
         self.assertEqual(a.max_retries, 2)
 
     def test_unique_ids(self):

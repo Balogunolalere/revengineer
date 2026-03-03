@@ -338,23 +338,12 @@ class DeepSeekClient:
             raise RuntimeError(f"Failed to get PoW: {result}")
         return result["data"]["biz_data"]["challenge"]
 
-    async def chat_completion(
-        self,
-        messages: list[dict],
-        thinking: bool = False,
-        search: bool = False,
-        stream: bool = False,
-    ) -> AsyncGenerator | dict:
-        """Send a chat completion request. Returns async generator if stream=True."""
-        self.total_requests += 1
-
-        # Create a new session for each request
+    async def _prepare_request(
+        self, messages: list[dict], thinking: bool, search: bool
+    ) -> tuple[dict, str, str]:
+        """Create session, solve PoW, build payload. Returns (payload, pow_response, session_id)."""
         chat_session_id = await self.create_session()
-
-        # Build prompt from messages (combine into single prompt for DS web)
         prompt = self._messages_to_prompt(messages)
-
-        # Get and solve PoW
         challenge = await self.get_pow_challenge()
         pow_response = await solve_pow_async(challenge)
 
@@ -367,11 +356,54 @@ class DeepSeekClient:
             "search_enabled": search,
             "preempt": False,
         }
+        return payload, pow_response, chat_session_id
 
-        if stream:
-            return self._stream_completion(payload, pow_response, chat_session_id)
-        else:
-            return await self._non_stream_completion(payload, pow_response, chat_session_id)
+    async def chat_completion(
+        self,
+        messages: list[dict],
+        thinking: bool = False,
+        search: bool = False,
+        stream: bool = False,
+        max_retries: int = 3,
+    ) -> AsyncGenerator | dict:
+        """Send a chat completion request. Returns async generator if stream=True.
+
+        Retries with fresh session + PoW on upstream 5xx errors.
+        """
+        self.total_requests += 1
+
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                payload, pow_response, session_id = await self._prepare_request(
+                    messages, thinking, search
+                )
+                if stream:
+                    return self._stream_completion(payload, pow_response, session_id)
+                else:
+                    return await self._non_stream_completion(payload, pow_response, session_id)
+            except HTTPException as e:
+                last_error = e
+                if e.status_code < 500 or attempt >= max_retries - 1:
+                    raise
+                delay = 2 ** attempt + 1
+                log.warning(
+                    f"Upstream {e.status_code} on attempt {attempt+1}/{max_retries}, "
+                    f"retrying with fresh session in {delay}s"
+                )
+                await asyncio.sleep(delay)
+            except Exception as e:
+                last_error = e
+                if attempt >= max_retries - 1:
+                    raise
+                delay = 2 ** attempt + 1
+                log.warning(
+                    f"Upstream error on attempt {attempt+1}/{max_retries}: {e}, "
+                    f"retrying in {delay}s"
+                )
+                await asyncio.sleep(delay)
+
+        raise last_error  # type: ignore[misc]
 
     def _messages_to_prompt(self, messages: list[dict]) -> str:
         """Convert OpenAI messages format to a single prompt string."""

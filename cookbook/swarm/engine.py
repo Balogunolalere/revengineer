@@ -186,8 +186,8 @@ class SwarmEngine:
 
                     started = time.time()
 
-                    # Run with timeout
-                    timeout = agent.timeout or self.config.agent_timeout
+                    # Run with timeout (agent-level overrides config default)
+                    timeout = agent.timeout if agent.timeout is not None else self.config.agent_timeout
                     content = await asyncio.wait_for(
                         self.runner(agent, self._results, self.config),
                         timeout=timeout,

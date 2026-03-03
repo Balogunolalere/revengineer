@@ -11,6 +11,7 @@ Handles:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import Any
@@ -23,6 +24,8 @@ from .models import (
 )
 from .config import SwarmConfig
 from .engine import SwarmEngine
+
+log = logging.getLogger(__name__)
 
 
 DECOMPOSE_SYSTEM = """You are a task orchestrator. Your job is to decompose a complex task into independent sub-tasks that can be executed in parallel by specialized AI agents.
@@ -167,10 +170,11 @@ class Orchestrator:
             payload["max_tokens"] = max_tokens
 
         full_content = ""
+        max_retries = self.config.max_retries + 3  # more resilient for LLM calls
 
         for continuation in range(max_continuations + 1):
             last_error = None
-            for attempt in range(3):
+            for attempt in range(max_retries):
                 try:
                     resp = await self.client.post("/chat/completions", json=payload)
                     resp.raise_for_status()
@@ -178,9 +182,11 @@ class Orchestrator:
                     break
                 except Exception as e:
                     last_error = e
-                    if attempt < 2:
+                    if attempt < max_retries - 1:
                         import asyncio
-                        await asyncio.sleep(2 ** attempt)
+                        delay = min(2 ** attempt + (attempt * 0.5), 30)
+                        log.warning(f"_chat attempt {attempt+1}/{max_retries} failed: {e}, retrying in {delay:.1f}s")
+                        await asyncio.sleep(delay)
             else:
                 raise last_error  # type: ignore[misc]
 

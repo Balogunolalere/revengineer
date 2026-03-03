@@ -17,6 +17,7 @@ build-backend = "setuptools.build_meta"
 [project.scripts]
 deepseek-cli = "deepseek_cli:main"
 deepseek-api = "deepseek_api:start"
+arsenal = "cookbook.arsenal.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["cookbook*"]

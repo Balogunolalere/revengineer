@@ -13,13 +13,15 @@
 
 ## ✨ What's Inside
 
-| File | Description |
-|------|-------------|
+| Component | Description |
+|-----------|-------------|
 | [`deepseek_cli.py`](deepseek_cli.py) | Interactive terminal chat with streaming, thinking, and web search |
 | [`deepseek_api.py`](deepseek_api.py) | FastAPI server — drop-in OpenAI `/v1/chat/completions` replacement |
 | [`pow_solver.js`](pow_solver.js) | Fast Node.js Proof-of-Work solver (~1.5s vs ~290s in Python) |
 | [`grab_token.py`](grab_token.py) | Browser-based token grabber for Google OAuth login |
 | [`stress_test.py`](stress_test.py) | Rate limit & load testing tool |
+| [`cookbook/swarm/`](cookbook/swarm/) | 🐝 DAG-based parallel agent orchestration with live spinner |
+| [`cookbook/arsenal/`](cookbook/arsenal/) | 🛡️ Autonomous offensive security platform with real tool execution |
 
 ---
 
@@ -319,13 +321,52 @@ revengineer/
 │   │   ├── orchestrator.py  # LLM decomposition + synthesis
 │   │   ├── renderer.py   # Live spinner + terminal output
 │   │   └── cli.py        # CLI entry point
+│   ├── arsenal/           # 🛡️ Autonomous offensive security platform
+│   │   ├── models.py     # Scope, targets, evidence, findings, missions
+│   │   ├── config.py     # ArsenalConfig with ARSENAL_* env vars
+│   │   ├── scope.py      # SHA-256 signed scope enforcement
+│   │   ├── executor.py   # Tool execution with safety controls
+│   │   ├── tools.py      # 11 tool wrappers with parsers
+│   │   ├── operators.py  # LLM-driven security operators
+│   │   ├── engine.py     # Mission orchestration engine
+│   │   ├── lab.py        # Docker attack lab
+│   │   ├── cli.py        # CLI entry point
+│   │   └── README.md     # Full documentation
 │   ├── examples/         # Ready-to-run example scripts
-│   └── tests/            # 64 unit tests
+│   └── tests/            # 222 unit tests (64 swarm + 158 arsenal)
 ├── pyproject.toml        # uv project config
 ├── requirements.txt      # pip dependencies
 ├── .env                  # Your secrets (git-ignored)
 └── .gitignore
 ```
+
+---
+
+## 🛡️ Arsenal — Offensive Security Platform
+
+Arsenal is a defense-grade autonomous security assessment platform. See the [full documentation](cookbook/arsenal/README.md).
+
+```bash
+# Build the Docker attack lab
+uv run arsenal lab --build
+
+# Run a dry-run assessment
+uv run arsenal assess --target scanme.nmap.org --dry-run
+
+# Quick port scan
+uv run arsenal scan --target 10.0.0.1
+
+# Generate a scope template
+uv run arsenal scope --export scope.json
+```
+
+**Key capabilities:**
+- 11 real security tools (nmap, nuclei, subfinder, httpx, ffuf, nikto, etc.)
+- SHA-256 signed scope enforcement with default-deny
+- Docker-isolated execution with minimal capabilities
+- LLM operators that iteratively decide what tools to run
+- Forensic evidence chain with integrity hashing
+- Markdown + JSON report generation
 
 ---
 

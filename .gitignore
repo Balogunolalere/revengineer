@@ -38,5 +38,15 @@ debug_search_sse.py
 # Browser profile (grab_token.py persistence)
 # ~/.deepseek_browser_profile is outside repo, no action needed
 
+# Swarm output files
+swarm_*.md
+swarm_*.json
+
+# Arsenal output files
+arsenal_*.json
+arsenal_*.md
+evidence/
+.arsenal-lab/
+
 # Token files (NEVER commit secrets)
 *.token

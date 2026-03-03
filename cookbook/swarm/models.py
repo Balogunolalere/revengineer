@@ -42,7 +42,7 @@ class AgentSpec:
     system_prompt: str = ""                # override system prompt
     tools: list[str] = field(default_factory=list)  # tool names this agent can use
     priority: int = 0                      # higher = runs first when possible
-    timeout: float = 120.0                 # per-agent timeout in seconds
+    timeout: float | None = None           # per-agent timeout (None = use config default)
     max_retries: int = 2
 
 
