@@ -22,11 +22,14 @@ from .models import (
     SwarmPlan,
     SwarmResult,
     SwarmMode,
+    BudgetTracker,
+    ContextWindow,
 )
 from .config import SwarmConfig
-from .engine import SwarmEngine, RateLimiter
+from .engine import SwarmEngine, RateLimiter, AdaptiveRateLimiter, CircuitBreaker, CircuitOpenError
 from .orchestrator import Orchestrator
 from .renderer import SwarmRenderer
+from .tool_registry import ToolRegistry, ToolDef
 
 
 async def Swarm(
@@ -35,6 +38,8 @@ async def Swarm(
     config: SwarmConfig | None = None,
     mode: SwarmMode = SwarmMode.AUTO,
     plan: SwarmPlan | None = None,
+    tool_registry: ToolRegistry | None = None,
+    budget: BudgetTracker | None = None,
     max_agents: int = 0,
     verbose: bool = False,
     save: bool = True,
@@ -59,7 +64,7 @@ async def Swarm(
         cfg.max_agents = max_agents
     renderer = SwarmRenderer(stream=cfg.stream_to_terminal, verbose=verbose)
 
-    async with Orchestrator(cfg) as orc:
+    async with Orchestrator(cfg, tool_registry=tool_registry, budget=budget) as orc:
         # Decompose
         if plan is None:
             plan = await orc.decompose(goal, mode)
@@ -107,4 +112,11 @@ __all__ = [
     "AgentResult",
     "AgentStatus",
     "RateLimiter",
+    "AdaptiveRateLimiter",
+    "CircuitBreaker",
+    "CircuitOpenError",
+    "ToolRegistry",
+    "ToolDef",
+    "BudgetTracker",
+    "ContextWindow",
 ]

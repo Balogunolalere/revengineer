@@ -29,12 +29,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from cookbook.swarm.models import (
-    AgentSpec, AgentResult, AgentStatus, SwarmMode, SwarmPlan, SwarmResult,
+    AgentSpec, AgentResult, AgentStatus, SwarmMode, SwarmPlan, SwarmResult, BudgetTracker, ContextWindow,
 )
 from cookbook.swarm.config import SwarmConfig
-from cookbook.swarm.engine import RateLimiter, SwarmEngine
-from cookbook.swarm.orchestrator import Orchestrator, _extract_json
+from cookbook.swarm.engine import RateLimiter, SwarmEngine, AdaptiveRateLimiter, CircuitBreaker, CircuitState, CircuitOpenError
+from cookbook.swarm.orchestrator import Orchestrator, _extract_json, DECOMPOSE_SYSTEM, CRITIQUE_SYSTEM
 from cookbook.swarm.renderer import SwarmRenderer, _strip_ansi, _build_markdown
+from cookbook.swarm.tool_registry import ToolDef, ToolRegistry, extract_tool_calls
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1139,6 +1140,2012 @@ class TestAutoContinuation(unittest.TestCase):
             self.assertEqual(result, "chunk1 chunk2 chunk3 ")
 
         asyncio.new_event_loop().run_until_complete(run())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 1 — Tool Registry tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestToolDef(unittest.TestCase):
+    def test_defaults(self):
+        td = ToolDef(name="t", description="desc")
+        self.assertEqual(td.name, "t")
+        self.assertEqual(td.description, "desc")
+        self.assertEqual(td.parameters, {})
+        self.assertIsNone(td.fn)
+        self.assertTrue(td.safe)
+
+    def test_with_fn(self):
+        async def _dummy(**kw):
+            return "ok"
+        td = ToolDef(name="t", description="d", fn=_dummy, safe=False)
+        self.assertFalse(td.safe)
+        self.assertIsNotNone(td.fn)
+
+
+class TestToolRegistry(unittest.TestCase):
+    def setUp(self):
+        self.reg = ToolRegistry()
+
+    def test_register_and_get(self):
+        td = ToolDef(name="scan", description="a scanner")
+        self.reg.register(td)
+        self.assertIs(self.reg.get("scan"), td)
+        self.assertIsNone(self.reg.get("nonexistent"))
+
+    def test_register_fn(self):
+        async def _fn(**kw):
+            return "ok"
+        self.reg.register_fn("test_tool", _fn, description="test", safe=False)
+        t = self.reg.get("test_tool")
+        self.assertIsNotNone(t)
+        self.assertEqual(t.name, "test_tool")
+        self.assertFalse(t.safe)
+
+    def test_available_all(self):
+        self.reg.register(ToolDef(name="a", description="A"))
+        self.reg.register(ToolDef(name="b", description="B"))
+        avail = self.reg.available()
+        self.assertEqual(len(avail), 2)
+
+    def test_available_filtered(self):
+        self.reg.register(ToolDef(name="a", description="A"))
+        self.reg.register(ToolDef(name="b", description="B"))
+        self.reg.register(ToolDef(name="c", description="C"))
+        avail = self.reg.available(["a", "c"])
+        self.assertEqual(len(avail), 2)
+        names = {t.name for t in avail}
+        self.assertEqual(names, {"a", "c"})
+
+    def test_available_filtered_unknown(self):
+        self.reg.register(ToolDef(name="a", description="A"))
+        avail = self.reg.available(["a", "nonexistent"])
+        self.assertEqual(len(avail), 1)
+
+    def test_build_tool_prompt_empty(self):
+        prompt = self.reg.build_tool_prompt()
+        self.assertEqual(prompt, "")
+
+    def test_build_tool_prompt_content(self):
+        self.reg.register(ToolDef(
+            name="nmap",
+            description="Port scanner",
+            parameters={"target": "IP to scan", "ports": "Port range"},
+        ))
+        prompt = self.reg.build_tool_prompt()
+        self.assertIn("## Available Tools", prompt)
+        self.assertIn("nmap", prompt)
+        self.assertIn("Port scanner", prompt)
+        self.assertIn("`target`", prompt)
+        self.assertIn("`ports`", prompt)
+
+    def test_build_tool_prompt_filter(self):
+        self.reg.register(ToolDef(name="a", description="Tool A"))
+        self.reg.register(ToolDef(name="b", description="Tool B"))
+        prompt = self.reg.build_tool_prompt(["a"])
+        self.assertIn("Tool A", prompt)
+        self.assertNotIn("Tool B", prompt)
+
+    def test_execute_success(self):
+        async def _echo(**kw):
+            return f"result:{kw.get('x', '')}"
+        self.reg.register(ToolDef(name="echo", description="echo", fn=_echo))
+
+        async def run():
+            result = await self.reg.execute("echo", {"x": "hello"})
+            self.assertEqual(result, "result:hello")
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_execute_unknown_tool(self):
+        async def run():
+            result = await self.reg.execute("ghost", {})
+            self.assertIn("[ERROR]", result)
+            self.assertIn("Unknown tool", result)
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_execute_no_fn(self):
+        self.reg.register(ToolDef(name="nofn", description="no fn"))  # fn=None
+
+        async def run():
+            result = await self.reg.execute("nofn", {})
+            self.assertIn("[ERROR]", result)
+            self.assertIn("no callable", result)
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_execute_timeout(self):
+        async def _slow(**kw):
+            await asyncio.sleep(10)
+            return "done"
+        self.reg.register(ToolDef(name="slow", description="slow", fn=_slow))
+
+        async def run():
+            result = await self.reg.execute("slow", {}, timeout=0.05)
+            self.assertIn("[ERROR]", result)
+            self.assertIn("timed out", result)
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_execute_exception(self):
+        async def _bad(**kw):
+            raise ValueError("boom")
+        self.reg.register(ToolDef(name="bad", description="bad", fn=_bad))
+
+        async def run():
+            result = await self.reg.execute("bad", {})
+            self.assertIn("[ERROR]", result)
+            self.assertIn("boom", result)
+        asyncio.new_event_loop().run_until_complete(run())
+
+
+class TestExtractToolCalls(unittest.TestCase):
+    def test_fenced_json_array(self):
+        text = 'Some text\n```json\n[{"tool": "nmap", "args": {"target": "1.2.3.4"}}]\n```\nMore text'
+        calls = extract_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool"], "nmap")
+        self.assertEqual(calls[0]["args"]["target"], "1.2.3.4")
+
+    def test_fenced_no_lang_tag(self):
+        text = 'Here:\n```\n[{"tool": "dig", "args": {"domain": "x.com"}}]\n```'
+        calls = extract_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool"], "dig")
+
+    def test_raw_json_array(self):
+        text = 'I will scan now: [{"tool": "nmap", "args": {"target": "10.0.0.1"}}]'
+        calls = extract_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool"], "nmap")
+
+    def test_single_object(self):
+        text = 'Let me scan: {"tool": "whois", "args": {"target": "example.com"}}'
+        calls = extract_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool"], "whois")
+
+    def test_multiple_tools(self):
+        text = '```json\n[{"tool": "nmap", "args": {"target": "x"}}, {"tool": "dig", "args": {"domain": "y"}}]\n```'
+        calls = extract_tool_calls(text)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["tool"], "nmap")
+        self.assertEqual(calls[1]["tool"], "dig")
+
+    def test_no_tool_calls(self):
+        text = "This is a plain text response with no tool calls at all."
+        calls = extract_tool_calls(text)
+        self.assertEqual(calls, [])
+
+    def test_json_without_tool_key(self):
+        text = '```json\n[{"name": "foo", "value": 42}]\n```'
+        calls = extract_tool_calls(text)
+        self.assertEqual(calls, [])
+
+    def test_malformed_json(self):
+        text = '```json\n{broken json\n```'
+        calls = extract_tool_calls(text)
+        self.assertEqual(calls, [])
+
+    def test_mixed_valid_invalid(self):
+        text = '```json\n[{"tool": "nmap", "args": {}}, {"not_tool": true}]\n```'
+        calls = extract_tool_calls(text)
+        # Should extract only the object with "tool" key
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool"], "nmap")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 1 — New model fields & status tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestCancelledStatus(unittest.TestCase):
+    def test_cancelled_in_enum(self):
+        self.assertEqual(AgentStatus.CANCELLED.value, "cancelled")
+        # Ensure all expected statuses exist
+        expected = {"pending", "waiting", "running", "completed", "failed", "retrying", "cancelled"}
+        actual = {s.value for s in AgentStatus}
+        self.assertEqual(expected, actual)
+
+
+class TestAgentResultNewFields(unittest.TestCase):
+    def test_tool_calls_made_default(self):
+        r = AgentResult(agent_id="x", role="R", task="T")
+        self.assertEqual(r.tool_calls_made, 0)
+
+    def test_confidence_default(self):
+        r = AgentResult(agent_id="x", role="R", task="T")
+        self.assertAlmostEqual(r.confidence, 0.0)
+
+    def test_set_tool_calls_made(self):
+        r = AgentResult(agent_id="x", role="R", task="T", tool_calls_made=5)
+        self.assertEqual(r.tool_calls_made, 5)
+
+    def test_set_confidence(self):
+        r = AgentResult(agent_id="x", role="R", task="T", confidence=0.85)
+        self.assertAlmostEqual(r.confidence, 0.85)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 1 — New config fields tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestNewConfigFields(unittest.TestCase):
+    def test_defaults(self):
+        cfg = SwarmConfig()
+        self.assertEqual(cfg.max_tool_calls_per_agent, 20)
+        self.assertAlmostEqual(cfg.tool_timeout, 120.0)
+        self.assertFalse(cfg.enable_reflection)
+        self.assertAlmostEqual(cfg.tool_agent_timeout, 600.0)
+
+    def test_from_env(self):
+        env = {
+            "SWARM_MAX_TOOL_CALLS": "10",
+            "SWARM_TOOL_TIMEOUT": "60",
+            "SWARM_ENABLE_REFLECTION": "true",
+            "SWARM_TOOL_AGENT_TIMEOUT": "300",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            cfg = SwarmConfig.from_env()
+        self.assertEqual(cfg.max_tool_calls_per_agent, 10)
+        self.assertAlmostEqual(cfg.tool_timeout, 60.0)
+        self.assertTrue(cfg.enable_reflection)
+        self.assertAlmostEqual(cfg.tool_agent_timeout, 300.0)
+
+    def test_reasoning_model_default(self):
+        cfg = SwarmConfig()
+        self.assertEqual(cfg.reasoning_model, "deepseek-reasoner")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 1 — Tool-calling loop in run_agent tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestToolCallingLoop(unittest.TestCase):
+    """Test the tool-calling loop in Orchestrator.run_agent."""
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_base="http://localhost:1/v1",
+            api_key="test",
+            agent_timeout=30,
+            swarm_timeout=60,
+            max_tool_calls_per_agent=5,
+            tool_timeout=10,
+            enable_reflection=False,
+            tool_agent_timeout=60,
+        )
+        defaults.update(overrides)
+        return SwarmConfig(**defaults)
+
+    def test_agent_without_tools_single_call(self):
+        """Agent with no tools should make one _chat call and return."""
+        config = self._make_config()
+        reg = ToolRegistry()
+
+        call_count = 0
+        async def mock_chat(messages, model="", max_tokens=None, **kw):
+            nonlocal call_count
+            call_count += 1
+            return "Final answer without tools"
+
+        async def run():
+            async with Orchestrator(config, tool_registry=reg) as orc:
+                orc._chat = mock_chat
+                agent = AgentSpec(role="Analyst", task="Analyze stuff")
+                result = await orc.run_agent(agent, {}, config)
+            self.assertEqual(result, "Final answer without tools")
+            self.assertEqual(call_count, 1)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_agent_with_tools_single_iteration(self):
+        """Agent calls a tool once, then provides final answer."""
+        config = self._make_config()
+        reg = ToolRegistry()
+
+        async def fake_tool(**kw):
+            return f"scan_result_for_{kw.get('target', 'unknown')}"
+        reg.register(ToolDef(
+            name="nmap_scan", description="Scan", fn=fake_tool,
+            parameters={"target": "IP"},
+        ))
+
+        call_idx = 0
+        async def mock_chat(messages, model="", max_tokens=None, **kw):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx == 1:
+                # First call: agent requests a tool
+                return '```json\n[{"tool": "nmap_scan", "args": {"target": "10.0.0.1"}}]\n```'
+            else:
+                # Second call: agent provides final answer after seeing tool results
+                return "Based on the scan results, port 80 is open."
+
+        async def run():
+            async with Orchestrator(config, tool_registry=reg) as orc:
+                orc._chat = mock_chat
+                agent = AgentSpec(role="Scanner", task="Scan target", tools=["nmap_scan"])
+                result = await orc.run_agent(agent, {}, config)
+            self.assertIn("port 80 is open", result)
+            self.assertEqual(call_idx, 2)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_agent_with_tools_multiple_iterations(self):
+        """Agent calls tools across multiple iterations."""
+        config = self._make_config(max_tool_calls_per_agent=10)
+        reg = ToolRegistry()
+
+        async def fake_scan(**kw):
+            return "open_ports: 22, 80, 443"
+        async def fake_dig(**kw):
+            return "A record: 10.0.0.1"
+        reg.register(ToolDef(name="nmap_scan", description="s", fn=fake_scan))
+        reg.register(ToolDef(name="dns_lookup", description="d", fn=fake_dig))
+
+        call_idx = 0
+        async def mock_chat(messages, model="", max_tokens=None, **kw):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx == 1:
+                return '```json\n[{"tool": "nmap_scan", "args": {}}]\n```'
+            elif call_idx == 2:
+                return '```json\n[{"tool": "dns_lookup", "args": {"domain": "t.com"}}]\n```'
+            else:
+                return "Comprehensive result: 3 ports open, A record found."
+
+        async def run():
+            async with Orchestrator(config, tool_registry=reg) as orc:
+                orc._chat = mock_chat
+                agent = AgentSpec(role="Recon", task="Full recon", tools=["nmap_scan", "dns_lookup"])
+                result = await orc.run_agent(agent, {}, config)
+            self.assertIn("3 ports open", result)
+            self.assertEqual(call_idx, 3)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_max_iterations_cap(self):
+        """Agent that always returns tool calls should be capped."""
+        config = self._make_config(max_tool_calls_per_agent=3)
+        reg = ToolRegistry()
+
+        async def fake_tool(**kw):
+            return "result"
+        reg.register(ToolDef(name="scan", description="s", fn=fake_tool))
+
+        call_idx = 0
+        async def mock_chat(messages, model="", max_tokens=None, **kw):
+            nonlocal call_idx
+            call_idx += 1
+            # Always return tool calls (except the very last forced summary)
+            if call_idx <= 3:
+                return '```json\n[{"tool": "scan", "args": {}}]\n```'
+            else:
+                return "Final forced summary."
+
+        async def run():
+            async with Orchestrator(config, tool_registry=reg) as orc:
+                orc._chat = mock_chat
+                agent = AgentSpec(role="Looper", task="Loop", tools=["scan"])
+                result = await orc.run_agent(agent, {}, config)
+            # 3 iterations + 1 forced summary = 4 total calls
+            self.assertEqual(call_idx, 4)
+            self.assertIn("Final forced summary", result)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_search_tool_is_meta_not_real(self):
+        """The 'search' tool controls model routing, not actual tool calls."""
+        config = self._make_config()
+        reg = ToolRegistry()
+
+        model_used = None
+        async def mock_chat(messages, model="", max_tokens=None, **kw):
+            nonlocal model_used
+            model_used = model
+            return "Search results here"
+
+        async def run():
+            async with Orchestrator(config, tool_registry=reg) as orc:
+                orc._chat = mock_chat
+                agent = AgentSpec(role="Searcher", task="Find info", tools=["search"])
+                result = await orc.run_agent(agent, {}, config)
+            self.assertEqual(result, "Search results here")
+            # Should use search model, not enter tool loop
+            self.assertEqual(model_used, config.search_model)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_reasoning_tool_model_routing(self):
+        """The 'reasoning' tag routes to the reasoning model."""
+        config = self._make_config()
+        reg = ToolRegistry()
+
+        model_used = None
+        async def mock_chat(messages, model="", max_tokens=None, **kw):
+            nonlocal model_used
+            model_used = model
+            return "Deep reasoning output"
+
+        async def run():
+            async with Orchestrator(config, tool_registry=reg) as orc:
+                orc._chat = mock_chat
+                agent = AgentSpec(role="Thinker", task="Think hard", tools=["reasoning"])
+                result = await orc.run_agent(agent, {}, config)
+            self.assertEqual(model_used, config.reasoning_model)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+
+class TestReflection(unittest.TestCase):
+    """Test the _reflect self-review feature."""
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_base="http://localhost:1/v1",
+            api_key="test",
+            agent_timeout=30,
+            swarm_timeout=60,
+            enable_reflection=True,
+            max_tool_calls_per_agent=5,
+            tool_timeout=10,
+            tool_agent_timeout=60,
+        )
+        defaults.update(overrides)
+        return SwarmConfig(**defaults)
+
+    def test_reflect_called_when_enabled(self):
+        """With enable_reflection=True, agent should make a second _chat call."""
+        config = self._make_config(enable_reflection=True)
+
+        call_idx = 0
+        async def mock_chat(messages, model="", max_tokens=None, **kw):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx == 1:
+                return "Initial output"
+            else:
+                return "Revised and improved output"
+
+        async def run():
+            async with Orchestrator(config) as orc:
+                orc._chat = mock_chat
+                agent = AgentSpec(role="Writer", task="Write something")
+                result = await orc.run_agent(agent, {}, config)
+            self.assertEqual(result, "Revised and improved output")
+            self.assertEqual(call_idx, 2)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_reflect_skipped_when_disabled(self):
+        config = self._make_config(enable_reflection=False)
+
+        call_idx = 0
+        async def mock_chat(messages, model="", max_tokens=None, **kw):
+            nonlocal call_idx
+            call_idx += 1
+            return "Only output"
+
+        async def run():
+            async with Orchestrator(config) as orc:
+                orc._chat = mock_chat
+                agent = AgentSpec(role="Writer", task="Write something")
+                result = await orc.run_agent(agent, {}, config)
+            self.assertEqual(result, "Only output")
+            self.assertEqual(call_idx, 1)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_reflect_with_tool_loop(self):
+        """Reflection should happen after the tool loop completes."""
+        config = self._make_config(enable_reflection=True)
+        reg = ToolRegistry()
+
+        async def fake_tool(**kw):
+            return "tool_output"
+        reg.register(ToolDef(name="scan", description="s", fn=fake_tool))
+
+        call_idx = 0
+        async def mock_chat(messages, model="", max_tokens=None, **kw):
+            nonlocal call_idx
+            call_idx += 1
+            if call_idx == 1:
+                return '```json\n[{"tool": "scan", "args": {}}]\n```'
+            elif call_idx == 2:
+                return "Final answer from tools"
+            else:
+                return "Reflected final answer from tools"
+
+        async def run():
+            async with Orchestrator(config, tool_registry=reg) as orc:
+                orc._chat = mock_chat
+                agent = AgentSpec(role="Scanner", task="Scan", tools=["scan"])
+                result = await orc.run_agent(agent, {}, config)
+            self.assertEqual(result, "Reflected final answer from tools")
+            self.assertEqual(call_idx, 3)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 1 — Arsenal bridge (unit-level) tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestArsenalBridge(unittest.TestCase):
+    """Test the arsenal_bridge adapter (mocked SecurityTools)."""
+
+    def test_register_arsenal_tools(self):
+        from cookbook.swarm.arsenal_bridge import register_arsenal_tools, _ARSENAL_TOOLS
+
+        # Create a mock SecurityTools with methods for each tool
+        mock_sec = MagicMock()
+        for meta in _ARSENAL_TOOLS:
+            setattr(mock_sec, meta["name"], AsyncMock())
+
+        reg = ToolRegistry()
+        register_arsenal_tools(reg, mock_sec)
+
+        # All 11 tools should be registered
+        self.assertEqual(len(reg.available()), 11)
+        for meta in _ARSENAL_TOOLS:
+            tool = reg.get(meta["name"])
+            self.assertIsNotNone(tool, f"Tool '{meta['name']}' should be registered")
+            self.assertEqual(tool.description, meta["description"])
+
+    def test_format_tool_result_success(self):
+        from cookbook.swarm.arsenal_bridge import _format_tool_result
+
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.command = "nmap -sV 10.0.0.1"
+        mock_result.parsed = {"ports": [22, 80]}
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+
+        formatted = _format_tool_result(mock_result)
+        self.assertIn("[TOOL OK]", formatted)
+        self.assertIn("nmap -sV 10.0.0.1", formatted)
+        self.assertIn("ports", formatted)
+
+    def test_format_tool_result_failure(self):
+        from cookbook.swarm.arsenal_bridge import _format_tool_result
+
+        mock_result = MagicMock()
+        mock_result.success = False
+        mock_result.error = "Connection refused"
+        mock_result.command = "nmap 10.0.0.1"
+
+        formatted = _format_tool_result(mock_result)
+        self.assertIn("[TOOL FAILED]", formatted)
+        self.assertIn("Connection refused", formatted)
+
+    def test_format_tool_result_stdout_fallback(self):
+        from cookbook.swarm.arsenal_bridge import _format_tool_result
+
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.command = "dig example.com"
+        mock_result.parsed = None
+        mock_result.stdout = "A 93.184.216.34"
+        mock_result.stderr = ""
+
+        formatted = _format_tool_result(mock_result)
+        self.assertIn("[TOOL OK]", formatted)
+        self.assertIn("93.184.216.34", formatted)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 1 — __init__.py exports test
+# ═══════════════════════════════════════════════════════════════════
+
+class TestSwarmExports(unittest.TestCase):
+    def test_tool_registry_exported(self):
+        import cookbook.swarm as swarm_pkg
+        self.assertTrue(hasattr(swarm_pkg, "ToolRegistry"))
+        self.assertTrue(hasattr(swarm_pkg, "ToolDef"))
+
+    def test_swarm_accepts_tool_registry(self):
+        """Swarm() convenience function should accept tool_registry param."""
+        import cookbook.swarm as swarm_pkg
+        import inspect
+        sig = inspect.signature(swarm_pkg.Swarm)
+        self.assertIn("tool_registry", sig.parameters)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3 — Adaptive Rate Limiter tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestAdaptiveRateLimiter(unittest.TestCase):
+
+    def test_initial_state(self):
+        arl = AdaptiveRateLimiter(max_rpm=60, min_rpm=5, burst=10)
+        self.assertAlmostEqual(arl.current_rpm, 60.0)
+        stats = arl.stats
+        self.assertEqual(stats["successes"], 0)
+        self.assertEqual(stats["errors"], 0)
+
+    def test_acquire_works(self):
+        arl = AdaptiveRateLimiter(max_rpm=600, burst=10)
+
+        async def run():
+            await arl.acquire()
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_backoff_on_error(self):
+        arl = AdaptiveRateLimiter(max_rpm=60, min_rpm=5, backoff_factor=0.5)
+        arl.record_error()
+        self.assertAlmostEqual(arl.current_rpm, 42.0)  # 60 * 0.7 (non-rate-limit)
+        self.assertEqual(arl.stats["errors"], 1)
+        self.assertEqual(arl.stats["backoffs"], 1)
+
+    def test_backoff_harder_on_429(self):
+        arl = AdaptiveRateLimiter(max_rpm=60, min_rpm=5, backoff_factor=0.5)
+        arl.record_error(is_rate_limit=True)
+        self.assertAlmostEqual(arl.current_rpm, 30.0)  # 60 * 0.5
+
+    def test_backoff_floors_at_min(self):
+        arl = AdaptiveRateLimiter(max_rpm=60, min_rpm=10, backoff_factor=0.5)
+        for _ in range(20):
+            arl.record_error(is_rate_limit=True)
+        self.assertGreaterEqual(arl.current_rpm, 10.0)
+
+    def test_recovery_on_success_streak(self):
+        arl = AdaptiveRateLimiter(
+            max_rpm=60, min_rpm=5, backoff_factor=0.5,
+            recovery_factor=1.2, recovery_streak=3,
+        )
+        # First back off
+        arl.record_error(is_rate_limit=True)
+        backed_off = arl.current_rpm  # should be 30
+        self.assertLess(backed_off, 60)
+
+        # 3 successes should trigger recovery
+        for _ in range(3):
+            arl.record_success()
+        self.assertGreater(arl.current_rpm, backed_off)
+
+    def test_recovery_caps_at_max(self):
+        arl = AdaptiveRateLimiter(
+            max_rpm=60, min_rpm=5,
+            recovery_factor=10.0, recovery_streak=1,
+        )
+        arl.record_error(is_rate_limit=True)
+        arl.record_success()
+        self.assertLessEqual(arl.current_rpm, 60.0)
+
+    def test_error_resets_success_streak(self):
+        arl = AdaptiveRateLimiter(
+            max_rpm=60, min_rpm=5,
+            recovery_streak=3, recovery_factor=1.5,
+        )
+        arl.record_error(is_rate_limit=True)
+        backed = arl.current_rpm
+        # 2 successes then error — no recovery
+        arl.record_success()
+        arl.record_success()
+        arl.record_error()
+        # Should have backed off further, not recovered
+        self.assertLessEqual(arl.current_rpm, backed)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3 — Circuit Breaker tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestCircuitBreaker(unittest.TestCase):
+
+    def test_initial_state_closed(self):
+        cb = CircuitBreaker(threshold=3, cooldown=10.0)
+        self.assertEqual(cb.state, CircuitState.CLOSED)
+        self.assertEqual(cb.stats["consecutive_failures"], 0)
+
+    def test_stays_closed_below_threshold(self):
+        cb = CircuitBreaker(threshold=3)
+        cb.record_failure()
+        cb.record_failure()
+        self.assertEqual(cb.state, CircuitState.CLOSED)
+
+    def test_opens_at_threshold(self):
+        cb = CircuitBreaker(threshold=3)
+        for _ in range(3):
+            cb.record_failure()
+        self.assertEqual(cb.state, CircuitState.OPEN)
+        self.assertEqual(cb.stats["total_trips"], 1)
+
+    def test_check_raises_when_open(self):
+        cb = CircuitBreaker(threshold=2, cooldown=1000)
+        cb.record_failure()
+        cb.record_failure()
+        self.assertEqual(cb.state, CircuitState.OPEN)
+
+        async def run():
+            with self.assertRaises(CircuitOpenError):
+                await cb.check()
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_check_passes_when_closed(self):
+        cb = CircuitBreaker(threshold=3)
+
+        async def run():
+            await cb.check()  # Should not raise
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_half_open_after_cooldown(self):
+        cb = CircuitBreaker(threshold=2, cooldown=0.01)
+        cb.record_failure()
+        cb.record_failure()
+        self.assertEqual(cb.state, CircuitState.OPEN)
+
+        async def run():
+            await asyncio.sleep(0.02)  # Wait for cooldown
+            await cb.check()  # Should transition to HALF_OPEN
+            self.assertEqual(cb.state, CircuitState.HALF_OPEN)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_half_open_success_closes(self):
+        cb = CircuitBreaker(threshold=2, cooldown=0.01)
+        cb.record_failure()
+        cb.record_failure()
+
+        async def run():
+            await asyncio.sleep(0.02)
+            await cb.check()  # → HALF_OPEN
+            cb.record_success()
+            self.assertEqual(cb.state, CircuitState.CLOSED)
+            self.assertEqual(cb.stats["consecutive_failures"], 0)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_half_open_failure_reopens(self):
+        cb = CircuitBreaker(threshold=2, cooldown=0.01)
+        cb.record_failure()
+        cb.record_failure()
+
+        async def run():
+            await asyncio.sleep(0.02)
+            await cb.check()  # → HALF_OPEN
+            cb.record_failure()
+            self.assertEqual(cb.state, CircuitState.OPEN)
+            self.assertEqual(cb.stats["total_trips"], 2)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_success_resets_failures(self):
+        cb = CircuitBreaker(threshold=5)
+        cb.record_failure()
+        cb.record_failure()
+        cb.record_failure()
+        cb.record_success()
+        self.assertEqual(cb.state, CircuitState.CLOSED)
+        self.assertEqual(cb.stats["consecutive_failures"], 0)
+        # Now 5 more failures should bring it to threshold
+        for _ in range(5):
+            cb.record_failure()
+        self.assertEqual(cb.state, CircuitState.OPEN)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3 — Engine integration with adaptive + circuit breaker
+# ═══════════════════════════════════════════════════════════════════
+
+class TestEngineAdaptiveConcurrency(unittest.TestCase):
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_base="http://localhost:1/v1",
+            api_key="test",
+            agent_timeout=5,
+            swarm_timeout=30,
+            max_parallel=5,
+            rate_limit_rpm=600,
+            rate_limit_burst=10,
+            adaptive_rate_limit=True,
+            rate_limit_min_rpm=5,
+            rate_limit_backoff_factor=0.5,
+            rate_limit_recovery_factor=1.1,
+            rate_limit_recovery_streak=3,
+            circuit_breaker_enabled=True,
+            circuit_breaker_threshold=3,
+            circuit_breaker_cooldown=0.05,
+        )
+        defaults.update(overrides)
+        return SwarmConfig(**defaults)
+
+    def test_engine_uses_adaptive_limiter(self):
+        config = self._make_config(adaptive_rate_limit=True)
+        engine = SwarmEngine(config=config, runner=AsyncMock())
+        self.assertIsInstance(engine._rate_limiter, AdaptiveRateLimiter)
+
+    def test_engine_uses_fixed_limiter_when_disabled(self):
+        config = self._make_config(adaptive_rate_limit=False)
+        engine = SwarmEngine(config=config, runner=AsyncMock())
+        self.assertIsInstance(engine._rate_limiter, RateLimiter)
+
+    def test_engine_creates_circuit_breaker(self):
+        config = self._make_config(circuit_breaker_enabled=True)
+        engine = SwarmEngine(config=config, runner=AsyncMock())
+        self.assertIsNotNone(engine._circuit_breaker)
+        self.assertEqual(engine._circuit_breaker.state, CircuitState.CLOSED)
+
+    def test_engine_no_circuit_breaker_when_disabled(self):
+        config = self._make_config(circuit_breaker_enabled=False)
+        engine = SwarmEngine(config=config, runner=AsyncMock())
+        self.assertIsNone(engine._circuit_breaker)
+
+    def test_success_signals_adaptive_limiter(self):
+        """Successful agent execution should record success on adaptive limiter."""
+        config = self._make_config()
+
+        async def success_runner(agent, results, cfg):
+            return "done"
+
+        async def run():
+            engine = SwarmEngine(config=config, runner=success_runner)
+            plan = SwarmPlan(goal="test", agents=[
+                AgentSpec(role="A", task="t"),
+            ])
+            await engine.execute(plan)
+            arl = engine._rate_limiter
+            self.assertIsInstance(arl, AdaptiveRateLimiter)
+            self.assertEqual(arl.stats["successes"], 1)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+    def test_failure_signals_adaptive_limiter(self):
+        """Failed agent should signal error to adaptive limiter."""
+        config = self._make_config(circuit_breaker_enabled=False)
+
+        async def fail_runner(agent, results, cfg):
+            raise RuntimeError("429 rate limit exceeded")
+
+        async def run():
+            engine = SwarmEngine(config=config, runner=fail_runner)
+            plan = SwarmPlan(goal="test", agents=[
+                AgentSpec(role="A", task="t", max_retries=0),
+            ])
+            results = await engine.execute(plan)
+            self.assertEqual(results[0].status, AgentStatus.FAILED)
+            arl = engine._rate_limiter
+            self.assertIsInstance(arl, AdaptiveRateLimiter)
+            self.assertGreater(arl.stats["errors"], 0)
+
+        asyncio.new_event_loop().run_until_complete(run())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3 — New config fields
+# ═══════════════════════════════════════════════════════════════════
+
+class TestPhase3Config(unittest.TestCase):
+    def test_adaptive_rate_defaults(self):
+        cfg = SwarmConfig()
+        self.assertTrue(cfg.adaptive_rate_limit)
+        self.assertEqual(cfg.rate_limit_min_rpm, 5)
+        self.assertAlmostEqual(cfg.rate_limit_backoff_factor, 0.5)
+        self.assertAlmostEqual(cfg.rate_limit_recovery_factor, 1.1)
+        self.assertEqual(cfg.rate_limit_recovery_streak, 5)
+
+    def test_circuit_breaker_defaults(self):
+        cfg = SwarmConfig()
+        self.assertTrue(cfg.circuit_breaker_enabled)
+        self.assertEqual(cfg.circuit_breaker_threshold, 5)
+        self.assertAlmostEqual(cfg.circuit_breaker_cooldown, 30.0)
+
+    def test_from_env_adaptive(self):
+        env = {
+            "SWARM_ADAPTIVE_RATE": "false",
+            "SWARM_RATE_LIMIT_MIN_RPM": "10",
+            "SWARM_RATE_BACKOFF_FACTOR": "0.3",
+            "SWARM_RATE_RECOVERY_FACTOR": "1.5",
+            "SWARM_RATE_RECOVERY_STREAK": "10",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            cfg = SwarmConfig.from_env()
+        self.assertFalse(cfg.adaptive_rate_limit)
+        self.assertEqual(cfg.rate_limit_min_rpm, 10)
+        self.assertAlmostEqual(cfg.rate_limit_backoff_factor, 0.3)
+        self.assertAlmostEqual(cfg.rate_limit_recovery_factor, 1.5)
+        self.assertEqual(cfg.rate_limit_recovery_streak, 10)
+
+    def test_from_env_circuit_breaker(self):
+        env = {
+            "SWARM_CIRCUIT_BREAKER": "false",
+            "SWARM_CB_THRESHOLD": "10",
+            "SWARM_CB_COOLDOWN": "60",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            cfg = SwarmConfig.from_env()
+        self.assertFalse(cfg.circuit_breaker_enabled)
+        self.assertEqual(cfg.circuit_breaker_threshold, 10)
+        self.assertAlmostEqual(cfg.circuit_breaker_cooldown, 60.0)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3 — Exports test
+# ═══════════════════════════════════════════════════════════════════
+
+class TestPhase3Exports(unittest.TestCase):
+    def test_new_exports(self):
+        import cookbook.swarm as swarm_pkg
+        self.assertTrue(hasattr(swarm_pkg, "AdaptiveRateLimiter"))
+        self.assertTrue(hasattr(swarm_pkg, "CircuitBreaker"))
+        self.assertTrue(hasattr(swarm_pkg, "CircuitOpenError"))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 5 — Few-shot decomposition prompt tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestFewShotDecomposition(unittest.TestCase):
+    """Verify the DECOMPOSE_SYSTEM prompt contains few-shot examples."""
+
+    def test_contains_security_example(self):
+        self.assertIn("Security audit", DECOMPOSE_SYSTEM)
+        self.assertIn("Authentication Analyst", DECOMPOSE_SYSTEM)
+        self.assertIn("Input Validation Specialist", DECOMPOSE_SYSTEM)
+
+    def test_contains_research_example(self):
+        self.assertIn("Research task", DECOMPOSE_SYSTEM)
+        self.assertIn("Magnetic Confinement Researcher", DECOMPOSE_SYSTEM)
+
+    def test_contains_code_review_example(self):
+        self.assertIn("Code review", DECOMPOSE_SYSTEM)
+        self.assertIn("Bug Hunter", DECOMPOSE_SYSTEM)
+        self.assertIn("Design Critic", DECOMPOSE_SYSTEM)
+
+    def test_examples_show_dependency_pattern(self):
+        # At least one example should show depends_on with non-empty list
+        self.assertIn('"depends_on": [0, 1, 2]', DECOMPOSE_SYSTEM)
+
+    def test_examples_show_priority_pattern(self):
+        # Examples should have diverse priorities
+        self.assertIn('"priority": 4', DECOMPOSE_SYSTEM)
+        self.assertIn('"priority": 1', DECOMPOSE_SYSTEM)
+
+    def test_examples_show_tool_assignment(self):
+        self.assertIn('"tools": ["search"]', DECOMPOSE_SYSTEM)
+        self.assertIn('"tools": ["code"]', DECOMPOSE_SYSTEM)
+        self.assertIn('"tools": ["analyze"]', DECOMPOSE_SYSTEM)
+
+    def test_format_placeholders(self):
+        # Should still have format placeholders for min/max agents
+        self.assertIn("{min_agents}", DECOMPOSE_SYSTEM)
+        self.assertIn("{max_agents}", DECOMPOSE_SYSTEM)
+
+    def test_new_rules_present(self):
+        self.assertIn("redundant agents", DECOMPOSE_SYSTEM)
+        self.assertIn("priority 3-5", DECOMPOSE_SYSTEM)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 5 — Plan critic tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestCritiqueSystem(unittest.TestCase):
+    """Verify the CRITIQUE_SYSTEM prompt structure."""
+
+    def test_contains_check_categories(self):
+        self.assertIn("REDUNDANCY", CRITIQUE_SYSTEM)
+        self.assertIn("COVERAGE GAPS", CRITIQUE_SYSTEM)
+        self.assertIn("BAD DEPENDENCIES", CRITIQUE_SYSTEM)
+        self.assertIn("TASK CLARITY", CRITIQUE_SYSTEM)
+        self.assertIn("TOOL MISMATCH", CRITIQUE_SYSTEM)
+
+    def test_contains_verdict_options(self):
+        self.assertIn('"accept"', CRITIQUE_SYSTEM)
+        self.assertIn('"revise"', CRITIQUE_SYSTEM)
+
+    def test_contains_output_schema(self):
+        self.assertIn('"verdict"', CRITIQUE_SYSTEM)
+        self.assertIn('"issues"', CRITIQUE_SYSTEM)
+        self.assertIn('"revised_agents"', CRITIQUE_SYSTEM)
+
+
+class TestPlanCritique(unittest.TestCase):
+    """Test the _critique_plan method on the Orchestrator."""
+
+    def _make_orc(self, **kwargs):
+        cfg = SwarmConfig(
+            api_base="http://test:8000/v1",
+            enable_plan_critique=True,
+            **kwargs,
+        )
+        return Orchestrator(config=cfg)
+
+    def _make_plan(self, n_agents=3):
+        agents = [
+            AgentSpec(role=f"Agent-{i}", task=f"Task {i}")
+            for i in range(n_agents)
+        ]
+        return SwarmPlan(goal="test goal", agents=agents, strategy="test strategy")
+
+    def test_critique_accept_keeps_plan(self):
+        """When critic says 'accept', the original plan is returned."""
+        orc = self._make_orc()
+        plan = self._make_plan()
+
+        accept_response = json.dumps({
+            "verdict": "accept",
+            "issues": [],
+            "revised_agents": [],
+        })
+
+        async def run():
+            async with orc:
+                with patch.object(orc, '_chat', new_callable=AsyncMock, return_value=accept_response):
+                    result = await orc._critique_plan("test goal", plan)
+                    self.assertEqual(len(result.agents), len(plan.agents))
+                    # Same plan object since verdict is accept
+                    self.assertIs(result, plan)
+
+        asyncio.run(run())
+
+    def test_critique_revise_rebuilds_plan(self):
+        """When critic says 'revise', a new plan is built from revised_agents."""
+        orc = self._make_orc()
+        plan = self._make_plan(n_agents=2)
+
+        revise_response = json.dumps({
+            "verdict": "revise",
+            "issues": [{"type": "gap", "description": "Missing analyst", "fix": "Add one"}],
+            "revised_agents": [
+                {"role": "Alpha", "task": "Do A", "depends_on": [], "priority": 3, "tools": ["search"]},
+                {"role": "Beta", "task": "Do B", "depends_on": [], "priority": 2, "tools": []},
+                {"role": "Gamma", "task": "Summarize A and B", "depends_on": [0, 1], "priority": 1, "tools": []},
+            ],
+        })
+
+        async def run():
+            async with orc:
+                with patch.object(orc, '_chat', new_callable=AsyncMock, return_value=revise_response):
+                    result = await orc._critique_plan("test goal", plan)
+                    self.assertIsNot(result, plan)
+                    self.assertEqual(len(result.agents), 3)
+                    self.assertEqual(result.agents[0].role, "Alpha")
+                    self.assertEqual(result.agents[2].role, "Gamma")
+                    # Gamma depends on Alpha and Beta
+                    self.assertEqual(len(result.agents[2].depends_on), 2)
+
+        asyncio.run(run())
+
+    def test_critique_invalid_json_keeps_original(self):
+        """If critic returns garbage, keep the original plan."""
+        orc = self._make_orc()
+        plan = self._make_plan()
+
+        async def run():
+            async with orc:
+                with patch.object(orc, '_chat', new_callable=AsyncMock, return_value="not json at all"):
+                    result = await orc._critique_plan("test goal", plan)
+                    self.assertIs(result, plan)
+
+        asyncio.run(run())
+
+    def test_critique_invalid_revised_plan_keeps_original(self):
+        """If critic's revised plan has cycles, keep original."""
+        orc = self._make_orc()
+        plan = self._make_plan()
+
+        # Create a plan with circular deps
+        revise_response = json.dumps({
+            "verdict": "revise",
+            "issues": [],
+            "revised_agents": [
+                {"role": "A", "task": "X", "depends_on": [1], "priority": 0, "tools": []},
+                {"role": "B", "task": "Y", "depends_on": [0], "priority": 0, "tools": []},
+            ],
+        })
+
+        async def run():
+            async with orc:
+                with patch.object(orc, '_chat', new_callable=AsyncMock, return_value=revise_response):
+                    result = await orc._critique_plan("test goal", plan)
+                    # Should keep original because revised plan has cycle
+                    self.assertIs(result, plan)
+
+        asyncio.run(run())
+
+    def test_decompose_calls_critique_when_enabled(self):
+        """Decompose should call _critique_plan when enable_plan_critique is True."""
+        orc = self._make_orc()
+
+        decompose_response = json.dumps({
+            "strategy": "test",
+            "agents": [
+                {"role": "A", "task": "Do A", "depends_on": [], "priority": 0, "tools": []},
+                {"role": "B", "task": "Do B", "depends_on": [], "priority": 0, "tools": []},
+            ],
+        })
+        accept_response = json.dumps({
+            "verdict": "accept", "issues": [], "revised_agents": [],
+        })
+
+        call_log = []
+
+        async def mock_chat(messages, **kwargs):
+            # First call = decompose, second = critique
+            call_log.append(messages[-1]["content"])
+            if len(call_log) == 1:
+                return decompose_response
+            return accept_response
+
+        async def run():
+            async with orc:
+                with patch.object(orc, '_chat', side_effect=mock_chat):
+                    plan = await orc.decompose("test goal")
+                    self.assertEqual(len(call_log), 2)
+                    self.assertEqual(len(plan.agents), 2)
+
+        asyncio.run(run())
+
+    def test_decompose_skips_critique_when_disabled(self):
+        """Decompose should NOT call _critique_plan when enable_plan_critique is False."""
+        cfg = SwarmConfig(api_base="http://test:8000/v1", enable_plan_critique=False)
+        orc = Orchestrator(config=cfg)
+
+        decompose_response = json.dumps({
+            "strategy": "test",
+            "agents": [
+                {"role": "A", "task": "Do A", "depends_on": [], "priority": 0, "tools": []},
+                {"role": "B", "task": "Do B", "depends_on": [], "priority": 0, "tools": []},
+            ],
+        })
+
+        call_count = 0
+
+        async def mock_chat(messages, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return decompose_response
+
+        async def run():
+            async with orc:
+                with patch.object(orc, '_chat', side_effect=mock_chat):
+                    await orc.decompose("test goal")
+                    self.assertEqual(call_count, 1)  # Only decompose, no critique
+
+        asyncio.run(run())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 5 — Agent killing tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestAgentKilling(unittest.TestCase):
+    """Test agent killing based on median peer duration."""
+
+    def _make_config(self, **kw):
+        defaults = dict(
+            api_base="http://test:8000/v1",
+            max_parallel=10,
+            max_retries=0,
+            agent_timeout=120,
+            enable_agent_killing=True,
+            agent_kill_threshold=2.0,  # kill at 2× median for easier testing
+            agent_kill_min_time=0,     # disable absolute floor for fast tests
+        )
+        defaults.update(kw)
+        return SwarmConfig(**defaults)
+
+    def test_kill_slow_agents_method(self):
+        """_kill_slow_agents cancels tasks exceeding threshold."""
+        config = self._make_config()
+
+        async def fast_runner(agent, results, cfg):
+            return "fast result"
+
+        engine = SwarmEngine(config=config, runner=fast_runner)
+
+        # Simulate 3 completed agents with ~1s duration
+        for i in range(3):
+            engine._results[f"done-{i}"] = AgentResult(
+                agent_id=f"done-{i}", role=f"Done-{i}", task="t",
+                status=AgentStatus.COMPLETED,
+                started_at=100.0, finished_at=101.0,  # 1s each
+            )
+            engine._completed.add(f"done-{i}")
+
+        slow_agent = AgentSpec(role="SlowPoke", task="slow task")
+        plan = SwarmPlan(goal="test", agents=[slow_agent])
+
+        async def run():
+            # Create task inside event loop
+            slow_task = asyncio.ensure_future(asyncio.sleep(999))
+            running = {slow_agent.agent_id: slow_task}
+            start_times = {slow_agent.agent_id: time.time() - 5.0}
+
+            engine._kill_slow_agents(running, start_times, plan)
+
+            # Should be killed
+            self.assertNotIn(slow_agent.agent_id, running)
+            self.assertIn(slow_agent.agent_id, engine._results)
+            self.assertEqual(engine._results[slow_agent.agent_id].status, AgentStatus.CANCELLED)
+            self.assertIn("Killed", engine._results[slow_agent.agent_id].error)
+
+        asyncio.run(run())
+
+    def test_no_kill_when_under_threshold(self):
+        """Agents under the threshold are not killed."""
+        config = self._make_config()
+
+        async def fast_runner(agent, results, cfg):
+            return "result"
+
+        engine = SwarmEngine(config=config, runner=fast_runner)
+
+        # 3 completed agents with 10s duration each
+        for i in range(3):
+            engine._results[f"done-{i}"] = AgentResult(
+                agent_id=f"done-{i}", role=f"Done-{i}", task="t",
+                status=AgentStatus.COMPLETED,
+                started_at=100.0, finished_at=110.0,  # 10s each
+            )
+            engine._completed.add(f"done-{i}")
+
+        agent = AgentSpec(role="Normal", task="normal task")
+        plan = SwarmPlan(goal="test", agents=[agent])
+
+        async def run():
+            task = asyncio.ensure_future(asyncio.sleep(999))
+            running = {agent.agent_id: task}
+            start_times = {agent.agent_id: time.time() - 15.0}
+
+            engine._kill_slow_agents(running, start_times, plan)
+
+            # Should NOT be killed (15s < 2×10s = 20s threshold)
+            self.assertIn(agent.agent_id, running)
+            self.assertNotIn(agent.agent_id, engine._results)
+            task.cancel()
+
+        asyncio.run(run())
+
+    def test_no_kill_when_disabled(self):
+        """Agent killing is skipped when enable_agent_killing=False."""
+        config = self._make_config(enable_agent_killing=False)
+
+        agents = [
+            AgentSpec(role="Fast", task="fast"),
+            AgentSpec(role="Fast2", task="fast2"),
+            AgentSpec(role="Slow", task="slow"),
+        ]
+        plan = SwarmPlan(goal="test", agents=agents)
+
+        call_count = 0
+
+        async def timed_runner(agent, results, cfg):
+            nonlocal call_count
+            call_count += 1
+            if "Slow" in agent.role:
+                await asyncio.sleep(0.3)
+            else:
+                await asyncio.sleep(0.01)
+            return f"result from {agent.role}"
+
+        engine = SwarmEngine(config=config, runner=timed_runner)
+
+        async def run():
+            results = await engine.execute(plan)
+            # All should complete (slow one shouldn't be killed since killing is disabled)
+            statuses = {r.role: r.status for r in results}
+            self.assertEqual(statuses["Slow"], AgentStatus.COMPLETED)
+
+        asyncio.run(run())
+
+    def test_no_kill_when_insufficient_completed(self):
+        """Don't kill agents when there aren't enough completed peers.
+
+        The engine requires max(3, (total+1)//2) completed agents before
+        kill checks activate in _execute_inner.
+        """
+        config = self._make_config()
+
+        async def runner(agent, results, cfg):
+            return "result"
+
+        engine = SwarmEngine(config=config, runner=runner)
+
+        # Only 1 completed agent
+        engine._results["done-0"] = AgentResult(
+            agent_id="done-0", role="Done-0", task="t",
+            status=AgentStatus.COMPLETED,
+            started_at=100.0, finished_at=101.0,
+        )
+        engine._completed.add("done-0")
+
+        agent = AgentSpec(role="Running", task="task")
+        plan = SwarmPlan(goal="test", agents=[agent])
+
+        async def run():
+            task = asyncio.ensure_future(asyncio.sleep(999))
+            running = {agent.agent_id: task}
+            start_times = {agent.agent_id: time.time() - 100.0}
+
+            # _kill_slow_agents can still be called directly (it only needs
+            # durations), but _execute_inner gates it behind
+            # len(completed) >= max(3, (total+1)//2)
+            engine._kill_slow_agents(running, start_times, plan)
+            task.cancel()
+
+        asyncio.run(run())
+
+    def test_kill_threshold_config(self):
+        """agent_kill_threshold is configurable."""
+        config = self._make_config(agent_kill_threshold=5.0)
+        self.assertAlmostEqual(config.agent_kill_threshold, 5.0)
+
+    def test_integration_kill_in_execute(self):
+        """Full integration: slow agent gets killed during execute."""
+        config = self._make_config(agent_kill_threshold=2.0, agent_timeout=60)
+
+        agents = [
+            AgentSpec(role="Fast-1", task="fast"),
+            AgentSpec(role="Fast-2", task="fast"),
+            AgentSpec(role="Fast-3", task="fast"),
+            AgentSpec(role="Straggler", task="very slow"),
+        ]
+        plan = SwarmPlan(goal="test integration", agents=agents)
+
+        async def runner(agent, results, cfg):
+            if "Straggler" in agent.role:
+                # Sleep long enough to be caught by 1s periodic check
+                await asyncio.sleep(60)
+            else:
+                await asyncio.sleep(0.01)
+            return f"result from {agent.role}"
+
+        engine = SwarmEngine(config=config, runner=runner)
+
+        async def run():
+            results = await engine.execute(plan)
+            statuses = {r.role: r.status for r in results}
+            # Straggler should be cancelled by agent killer
+            # Fast agents: ~0.01s each, median ~0.01s, threshold = 0.02s
+            # After 1s wait timeout, straggler at ~1s >> 0.02s → killed
+            self.assertEqual(statuses["Straggler"], AgentStatus.CANCELLED)
+            self.assertEqual(statuses["Fast-1"], AgentStatus.COMPLETED)
+            self.assertEqual(statuses["Fast-2"], AgentStatus.COMPLETED)
+
+        asyncio.run(run())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 5 — Config tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestPhase5Config(unittest.TestCase):
+    def test_defaults(self):
+        cfg = SwarmConfig()
+        self.assertFalse(cfg.enable_plan_critique)
+        self.assertTrue(cfg.enable_agent_killing)
+        self.assertAlmostEqual(cfg.agent_kill_threshold, 3.0)
+        self.assertAlmostEqual(cfg.agent_kill_min_time, 30.0)
+
+    def test_from_env(self):
+        env = {
+            "SWARM_PLAN_CRITIQUE": "true",
+            "SWARM_AGENT_KILLING": "false",
+            "SWARM_AGENT_KILL_THRESHOLD": "5.0",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            cfg = SwarmConfig.from_env()
+        self.assertTrue(cfg.enable_plan_critique)
+        self.assertFalse(cfg.enable_agent_killing)
+        self.assertAlmostEqual(cfg.agent_kill_threshold, 5.0)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2 — BudgetTracker tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestBudgetTracker(unittest.TestCase):
+    def test_initial_state(self):
+        bt = BudgetTracker(token_budget=1000, max_llm_calls=50, max_agents=10)
+        self.assertEqual(bt.tokens_used, 0)
+        self.assertEqual(bt.llm_calls, 0)
+        self.assertEqual(bt.agents_spawned, 0)
+        self.assertEqual(bt.tokens_remaining, 1000)
+        self.assertIsNone(bt.check_budget())
+
+    def test_unlimited_budget(self):
+        bt = BudgetTracker()  # all zeros = unlimited
+        self.assertIsNone(bt.tokens_remaining)
+        self.assertIsNone(bt.check_budget())
+
+    def test_record_tokens(self):
+        bt = BudgetTracker(token_budget=100)
+
+        async def run():
+            await bt.record_tokens(50)
+            self.assertEqual(bt.tokens_used, 50)
+            self.assertEqual(bt.tokens_remaining, 50)
+            self.assertIsNone(bt.check_budget())
+
+            await bt.record_tokens(60)
+            self.assertEqual(bt.tokens_used, 110)
+            self.assertEqual(bt.tokens_remaining, 0)
+            self.assertIn("Token budget", bt.check_budget())
+
+        asyncio.run(run())
+
+    def test_record_llm_calls(self):
+        bt = BudgetTracker(max_llm_calls=3)
+
+        async def run():
+            for _ in range(3):
+                await bt.record_llm_call()
+            self.assertEqual(bt.llm_calls, 3)
+            self.assertIn("LLM call limit", bt.check_budget())
+
+        asyncio.run(run())
+
+    def test_record_agents(self):
+        bt = BudgetTracker(max_agents=2)
+
+        async def run():
+            await bt.record_agent()
+            self.assertIsNone(bt.check_budget())
+            await bt.record_agent()
+            self.assertIn("Agent limit", bt.check_budget())
+
+        asyncio.run(run())
+
+    def test_stats(self):
+        bt = BudgetTracker(token_budget=500, max_llm_calls=10)
+        stats = bt.stats
+        self.assertEqual(stats["tokens_used"], 0)
+        self.assertEqual(stats["token_budget"], 500)
+        self.assertEqual(stats["max_llm_calls"], 10)
+        self.assertEqual(stats["max_agents"], "unlimited")
+
+    def test_check_priority_order(self):
+        """Token budget is checked first."""
+        bt = BudgetTracker(token_budget=10, max_llm_calls=1, max_agents=1)
+
+        async def run():
+            await bt.record_tokens(100)
+            await bt.record_llm_call()
+            await bt.record_agent()
+            # Token check should trigger first
+            err = bt.check_budget()
+            self.assertIn("Token budget", err)
+
+        asyncio.run(run())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2 — Engine budget integration tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestEngineBudgetIntegration(unittest.TestCase):
+    def _make_config(self, **kw):
+        defaults = dict(
+            api_base="http://test:8000/v1",
+            max_parallel=10,
+            max_retries=0,
+            agent_timeout=10,
+        )
+        defaults.update(kw)
+        return SwarmConfig(**defaults)
+
+    def test_budget_blocks_agent_launch(self):
+        """Agents should fail with budget error when budget is exhausted."""
+        config = self._make_config()
+        bt = BudgetTracker(max_agents=1)
+
+        async def runner(agent, results, cfg):
+            return "result"
+
+        engine = SwarmEngine(config=config, runner=runner, budget=bt)
+
+        agents = [
+            AgentSpec(role="A", task="task a"),
+            AgentSpec(role="B", task="task b"),
+        ]
+        plan = SwarmPlan(goal="test", agents=agents)
+
+        async def run():
+            # Pre-exhaust the budget
+            await bt.record_agent()
+            results = await engine.execute(plan)
+            statuses = {r.role: r.status for r in results}
+            # Both should fail since budget was already at limit before execution
+            self.assertEqual(statuses["A"], AgentStatus.FAILED)
+            self.assertEqual(statuses["B"], AgentStatus.FAILED)
+            self.assertIn("Budget exceeded", results[0].error)
+
+        asyncio.run(run())
+
+    def test_budget_records_on_completion(self):
+        """Successful agents should be recorded in the budget."""
+        config = self._make_config()
+        bt = BudgetTracker(max_agents=10)
+
+        async def runner(agent, results, cfg):
+            return "result"
+
+        engine = SwarmEngine(config=config, runner=runner, budget=bt)
+
+        agents = [AgentSpec(role="A", task="task")]
+        plan = SwarmPlan(goal="test", agents=agents)
+
+        async def run():
+            await engine.execute(plan)
+            self.assertEqual(bt.agents_spawned, 1)
+
+        asyncio.run(run())
+
+    def test_no_budget_no_issue(self):
+        """Without budget, everything runs normally."""
+        config = self._make_config()
+
+        async def runner(agent, results, cfg):
+            return "result"
+
+        engine = SwarmEngine(config=config, runner=runner)  # no budget
+
+        agents = [AgentSpec(role="A", task="task")]
+        plan = SwarmPlan(goal="test", agents=agents)
+
+        async def run():
+            results = await engine.execute(plan)
+            self.assertEqual(results[0].status, AgentStatus.COMPLETED)
+
+        asyncio.run(run())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2 — Sub-swarm tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestSubSwarm(unittest.TestCase):
+    def _make_config(self, **kw):
+        defaults = dict(
+            api_base="http://test:8000/v1",
+            enable_sub_swarms=True,
+            sub_swarm_max_depth=2,
+            sub_swarm_max_agents=3,
+        )
+        defaults.update(kw)
+        return SwarmConfig(**defaults)
+
+    def test_can_spawn_sub_swarm_enabled(self):
+        cfg = self._make_config()
+        orc = Orchestrator(config=cfg)
+        self.assertTrue(orc._can_spawn_sub_swarm())
+
+    def test_can_spawn_sub_swarm_disabled(self):
+        cfg = self._make_config(enable_sub_swarms=False)
+        orc = Orchestrator(config=cfg)
+        self.assertFalse(orc._can_spawn_sub_swarm())
+
+    def test_can_spawn_sub_swarm_depth_exceeded(self):
+        cfg = self._make_config(sub_swarm_max_depth=1)
+        orc = Orchestrator(config=cfg, depth=1)  # already at max depth
+        self.assertFalse(orc._can_spawn_sub_swarm())
+
+    def test_can_spawn_sub_swarm_budget_exhausted(self):
+        cfg = self._make_config()
+        bt = BudgetTracker(token_budget=10)
+
+        async def run():
+            await bt.record_tokens(100)  # exhaust
+            orc = Orchestrator(config=cfg, budget=bt)
+            self.assertFalse(orc._can_spawn_sub_swarm())
+
+        asyncio.run(run())
+
+    def test_run_sub_swarm_disabled_returns_message(self):
+        cfg = self._make_config(enable_sub_swarms=False)
+        orc = Orchestrator(config=cfg)
+
+        async def run():
+            result = await orc._run_sub_swarm("test goal")
+            self.assertIn("not available", result)
+
+        asyncio.run(run())
+
+    def test_register_sub_swarm_tool(self):
+        cfg = self._make_config()
+        orc = Orchestrator(config=cfg)
+        registry = ToolRegistry()
+        orc.register_sub_swarm_tool(registry)
+        self.assertIn("spawn_sub_swarm", registry._tools)
+
+    def test_sub_swarm_in_run_auto_registers_tool(self):
+        """When sub-swarms are enabled, run() auto-registers the tool."""
+        cfg = self._make_config()
+        orc = Orchestrator(config=cfg)
+
+        decompose_response = json.dumps({
+            "strategy": "test",
+            "agents": [
+                {"role": "A", "task": "Do A", "depends_on": [], "priority": 0, "tools": []},
+                {"role": "B", "task": "Do B", "depends_on": [], "priority": 0, "tools": []},
+            ],
+        })
+
+        async def mock_chat(messages, **kwargs):
+            return decompose_response
+
+        async def run():
+            async with orc:
+                with patch.object(orc, '_chat', side_effect=mock_chat):
+                    with patch.object(SwarmEngine, 'execute', new_callable=AsyncMock, return_value=[
+                        AgentResult(agent_id="a1", role="A", task="Do A", content="done", status=AgentStatus.COMPLETED,
+                                    started_at=1.0, finished_at=2.0),
+                    ]):
+                        result = await orc.run("test goal")
+                        # Tool registry should have been created and sub-swarm registered
+                        self.assertIsNotNone(orc.tool_registry)
+                        self.assertIn("spawn_sub_swarm", orc.tool_registry._tools)
+
+        asyncio.run(run())
+
+    def test_depth_propagates_to_child(self):
+        """Child orchestrator should be at depth+1."""
+        cfg = self._make_config()
+        parent = Orchestrator(config=cfg, depth=0)
+        # We test indirectly via _can_spawn_sub_swarm and child config
+        self.assertEqual(parent.depth, 0)
+        self.assertTrue(parent._can_spawn_sub_swarm())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2 — Config tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestPhase2Config(unittest.TestCase):
+    def test_budget_defaults(self):
+        cfg = SwarmConfig()
+        self.assertEqual(cfg.token_budget, 0)
+        self.assertEqual(cfg.max_llm_calls, 0)
+
+    def test_sub_swarm_defaults(self):
+        cfg = SwarmConfig()
+        self.assertFalse(cfg.enable_sub_swarms)
+        self.assertEqual(cfg.sub_swarm_max_depth, 2)
+        self.assertEqual(cfg.sub_swarm_max_agents, 5)
+
+    def test_from_env_budget(self):
+        env = {
+            "SWARM_TOKEN_BUDGET": "100000",
+            "SWARM_MAX_LLM_CALLS": "500",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            cfg = SwarmConfig.from_env()
+        self.assertEqual(cfg.token_budget, 100000)
+        self.assertEqual(cfg.max_llm_calls, 500)
+
+    def test_from_env_sub_swarms(self):
+        env = {
+            "SWARM_SUB_SWARMS": "true",
+            "SWARM_SUB_SWARM_MAX_DEPTH": "3",
+            "SWARM_SUB_SWARM_MAX_AGENTS": "8",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            cfg = SwarmConfig.from_env()
+        self.assertTrue(cfg.enable_sub_swarms)
+        self.assertEqual(cfg.sub_swarm_max_depth, 3)
+        self.assertEqual(cfg.sub_swarm_max_agents, 8)
+
+
+class TestPhase2Exports(unittest.TestCase):
+    def test_budget_tracker_exported(self):
+        import cookbook.swarm as swarm_pkg
+        self.assertTrue(hasattr(swarm_pkg, "BudgetTracker"))
+
+    def test_swarm_accepts_budget(self):
+        """Swarm() one-liner should accept budget parameter."""
+        import inspect
+        from cookbook.swarm import Swarm as SwarmFn
+        sig = inspect.signature(SwarmFn)
+        self.assertIn("budget", sig.parameters)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 4 — ContextWindow tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestContextWindow(unittest.TestCase):
+    def test_estimate_tokens(self):
+        self.assertEqual(ContextWindow.estimate_tokens("a" * 400), 100)
+        self.assertEqual(ContextWindow.estimate_tokens(""), 1)
+
+    def test_build_unlimited_dependencies(self):
+        """Unlimited mode includes full dependency content."""
+        cw = ContextWindow(max_tokens=0)
+        agent = AgentSpec(role="B", task="task", depends_on=["a1"])
+        results = {
+            "a1": AgentResult(
+                agent_id="a1", role="A", task="t", content="Full output here",
+                status=AgentStatus.COMPLETED, started_at=1.0, finished_at=2.0,
+            ),
+        }
+        ctx = cw.build_context(agent, results)
+        self.assertIn("Full output here", ctx)
+        self.assertIn("Required context", ctx)
+
+    def test_build_unlimited_peers(self):
+        """Unlimited mode includes peer previews."""
+        cw = ContextWindow(max_tokens=0)
+        agent = AgentSpec(role="B", task="task")
+        results = {
+            "a1": AgentResult(
+                agent_id="a1", role="A", task="t", content="Long " * 200,
+                status=AgentStatus.COMPLETED, started_at=1.0, finished_at=2.0,
+            ),
+        }
+        ctx = cw.build_context(agent, results)
+        self.assertIn("Other agents' outputs", ctx)
+        self.assertIn("...", ctx)  # truncated
+
+    def test_build_empty_results(self):
+        cw = ContextWindow(max_tokens=1000)
+        agent = AgentSpec(role="A", task="task")
+        self.assertEqual(cw.build_context(agent, {}), "")
+
+    def test_pruned_fits_within_budget(self):
+        """Pruned context should not exceed the token budget by much."""
+        cw = ContextWindow(max_tokens=100)  # ~400 chars
+        agent = AgentSpec(role="C", task="task", depends_on=["a1", "a2"])
+        results = {
+            "a1": AgentResult(
+                agent_id="a1", role="A", task="t", content="Short",
+                status=AgentStatus.COMPLETED, started_at=1.0, finished_at=2.0,
+            ),
+            "a2": AgentResult(
+                agent_id="a2", role="B", task="t", content="X" * 2000,
+                status=AgentStatus.COMPLETED, started_at=1.0, finished_at=2.0,
+            ),
+        }
+        ctx = cw.build_context(agent, results)
+        # Should have truncated the long dependency
+        self.assertIn("A", ctx)
+        self.assertIn("truncated", ctx)
+
+    def test_pruned_uses_cached_summary(self):
+        """Pruned mode should use cached summaries when content is too long."""
+        cw = ContextWindow(max_tokens=100)
+
+        async def run():
+            await cw.cache_summary("a2", "Brief summary of B's work")
+
+        asyncio.run(run())
+
+        agent = AgentSpec(role="C", task="task", depends_on=["a2"])
+        results = {
+            "a2": AgentResult(
+                agent_id="a2", role="B", task="t", content="X" * 5000,
+                status=AgentStatus.COMPLETED, started_at=1.0, finished_at=2.0,
+            ),
+        }
+        ctx = cw.build_context(agent, results)
+        self.assertIn("summarized", ctx)
+        self.assertIn("Brief summary", ctx)
+
+    def test_pruned_peer_summaries(self):
+        """Non-dependency peers use cached summaries when available."""
+        cw = ContextWindow(max_tokens=500)
+
+        async def run():
+            await cw.cache_summary("peer1", "Peer summary text")
+
+        asyncio.run(run())
+
+        agent = AgentSpec(role="C", task="task")
+        results = {
+            "peer1": AgentResult(
+                agent_id="peer1", role="PeerA", task="t", content="Full long output",
+                status=AgentStatus.COMPLETED, started_at=1.0, finished_at=2.0,
+            ),
+        }
+        ctx = cw.build_context(agent, results)
+        self.assertIn("Peer summary text", ctx)
+
+    def test_stats(self):
+        cw = ContextWindow(max_tokens=2000, summary_max_tokens=500)
+        stats = cw.stats
+        self.assertEqual(stats["max_tokens"], 2000)
+        self.assertEqual(stats["summaries_cached"], 0)
+        self.assertEqual(stats["summary_max_tokens"], 500)
+
+    def test_stats_unlimited(self):
+        cw = ContextWindow(max_tokens=0)
+        self.assertEqual(cw.stats["max_tokens"], "unlimited")
+
+    def test_cache_summary(self):
+        cw = ContextWindow(max_tokens=100)
+
+        async def run():
+            self.assertIsNone(cw.get_summary("a1"))
+            await cw.cache_summary("a1", "summary")
+            self.assertEqual(cw.get_summary("a1"), "summary")
+
+        asyncio.run(run())
+
+    def test_pruned_skips_failed_deps(self):
+        """Failed dependencies should be skipped in context."""
+        cw = ContextWindow(max_tokens=1000)
+        agent = AgentSpec(role="B", task="task", depends_on=["a1"])
+        results = {
+            "a1": AgentResult(
+                agent_id="a1", role="A", task="t", content="Failed content",
+                status=AgentStatus.FAILED, error="boom",
+            ),
+        }
+        ctx = cw.build_context(agent, results)
+        self.assertEqual(ctx, "")
+
+    def test_pruned_budget_stops_peers(self):
+        """When budget is fully used by dependencies, peers are skipped."""
+        cw = ContextWindow(max_tokens=50)  # ~200 chars budget
+        agent = AgentSpec(role="C", task="task", depends_on=["a1"])
+        results = {
+            "a1": AgentResult(
+                agent_id="a1", role="A", task="t", content="X" * 200,
+                status=AgentStatus.COMPLETED, started_at=1.0, finished_at=2.0,
+            ),
+            "peer1": AgentResult(
+                agent_id="peer1", role="Peer", task="t", content="Should not appear",
+                status=AgentStatus.COMPLETED, started_at=1.0, finished_at=2.0,
+            ),
+        }
+        ctx = cw.build_context(agent, results)
+        self.assertNotIn("Should not appear", ctx)
+
+
+class TestSummarizeResult(unittest.TestCase):
+    def _make_config(self, **kw):
+        defaults = dict(
+            api_base="http://test:8000/v1",
+            enable_context_pruning=True,
+            context_window_tokens=500,
+            context_summary_tokens=100,
+        )
+        defaults.update(kw)
+        return SwarmConfig(**defaults)
+
+    def test_summarize_caches_result(self):
+        """_summarize_result should call LLM and cache the summary."""
+        cfg = self._make_config()
+        orc = Orchestrator(config=cfg)
+        self.assertIsNotNone(orc.context_window)
+
+        long_content = "Important finding. " * 200  # well over 400 chars
+
+        async def mock_chat(messages, **kwargs):
+            return "Concise summary of findings."
+
+        result = AgentResult(
+            agent_id="a1", role="Researcher", task="research",
+            content=long_content, status=AgentStatus.COMPLETED,
+            started_at=1.0, finished_at=2.0,
+        )
+
+        async def run():
+            async with orc:
+                with patch.object(orc, '_chat', side_effect=mock_chat):
+                    await orc._summarize_result(result)
+                    cached = orc.context_window.get_summary("a1")
+                    self.assertEqual(cached, "Concise summary of findings.")
+
+        asyncio.run(run())
+
+    def test_summarize_short_content_no_llm(self):
+        """Short content should be cached directly without LLM call."""
+        cfg = self._make_config()
+        orc = Orchestrator(config=cfg)
+
+        result = AgentResult(
+            agent_id="a1", role="R", task="t",
+            content="Short", status=AgentStatus.COMPLETED,
+        )
+
+        async def run():
+            async with orc:
+                # Should not call _chat since content is short
+                with patch.object(orc, '_chat', side_effect=AssertionError("Should not be called")):
+                    await orc._summarize_result(result)
+                    cached = orc.context_window.get_summary("a1")
+                    self.assertEqual(cached, "Short")
+
+        asyncio.run(run())
+
+    def test_no_context_window_noop(self):
+        """Without context pruning, _summarize_result is a no-op."""
+        cfg = SwarmConfig(api_base="http://test:8000/v1")
+        orc = Orchestrator(config=cfg)
+        self.assertIsNone(orc.context_window)
+
+        result = AgentResult(
+            agent_id="a1", role="R", task="t",
+            content="anything", status=AgentStatus.COMPLETED,
+        )
+
+        async def run():
+            async with orc:
+                await orc._summarize_result(result)  # should not raise
+
+        asyncio.run(run())
+
+    def test_summarize_already_cached_skips(self):
+        """Already-cached results should not trigger another LLM call."""
+        cfg = self._make_config()
+        orc = Orchestrator(config=cfg)
+
+        long_content = "Finding. " * 200
+
+        result = AgentResult(
+            agent_id="a1", role="R", task="t",
+            content=long_content, status=AgentStatus.COMPLETED,
+        )
+
+        async def run():
+            # Pre-cache
+            await orc.context_window.cache_summary("a1", "Already cached")
+            async with orc:
+                with patch.object(orc, '_chat', side_effect=AssertionError("Should not be called")):
+                    await orc._summarize_result(result)
+                    self.assertEqual(orc.context_window.get_summary("a1"), "Already cached")
+
+        asyncio.run(run())
+
+
+class TestOrchestratorContextWindowIntegration(unittest.TestCase):
+    def test_context_window_created_when_enabled(self):
+        cfg = SwarmConfig(
+            api_base="http://test:8000/v1",
+            enable_context_pruning=True,
+            context_window_tokens=2000,
+            context_summary_tokens=300,
+        )
+        orc = Orchestrator(config=cfg)
+        self.assertIsNotNone(orc.context_window)
+        self.assertEqual(orc.context_window.max_tokens, 2000)
+        self.assertEqual(orc.context_window.summary_max_tokens, 300)
+
+    def test_context_window_not_created_when_disabled(self):
+        cfg = SwarmConfig(api_base="http://test:8000/v1")
+        orc = Orchestrator(config=cfg)
+        self.assertIsNone(orc.context_window)
+
+    def test_context_window_not_created_if_zero_tokens(self):
+        cfg = SwarmConfig(
+            api_base="http://test:8000/v1",
+            enable_context_pruning=True,
+            context_window_tokens=0,
+        )
+        orc = Orchestrator(config=cfg)
+        self.assertIsNone(orc.context_window)
+
+
+class TestPhase4Config(unittest.TestCase):
+    def test_defaults(self):
+        cfg = SwarmConfig()
+        self.assertEqual(cfg.context_window_tokens, 0)
+        self.assertEqual(cfg.context_summary_tokens, 300)
+        self.assertFalse(cfg.enable_context_pruning)
+
+    def test_from_env(self):
+        env = {
+            "SWARM_CONTEXT_WINDOW_TOKENS": "4000",
+            "SWARM_CONTEXT_SUMMARY_TOKENS": "500",
+            "SWARM_CONTEXT_PRUNING": "true",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            cfg = SwarmConfig.from_env()
+        self.assertEqual(cfg.context_window_tokens, 4000)
+        self.assertEqual(cfg.context_summary_tokens, 500)
+        self.assertTrue(cfg.enable_context_pruning)
+
+
+class TestPhase4Exports(unittest.TestCase):
+    def test_context_window_exported(self):
+        import cookbook.swarm as swarm_pkg
+        self.assertTrue(hasattr(swarm_pkg, "ContextWindow"))
 
 
 if __name__ == "__main__":

@@ -217,6 +217,109 @@ async def solve_pow_async(challenge_data: dict) -> str:
 
 
 # ============================================================================
+# PoW Prefetch Pool
+# ============================================================================
+class PoWPool:
+    """Pre-solves PoW challenges in the background to reduce request latency.
+
+    Maintains a queue of ready (challenge, solution) pairs. When a request
+    needs a PoW, it can grab a pre-solved one instantly instead of waiting.
+    Solutions are validated for expiry before use.
+    """
+
+    def __init__(self, pool_size: int = 3, safety_margin: float = 30.0):
+        self._pool_size = pool_size
+        self._safety_margin = safety_margin  # seconds before expire_at to discard
+        self._queue: asyncio.Queue[tuple[dict, str]] = asyncio.Queue(maxsize=pool_size)
+        self._get_challenge: Optional[Any] = None  # set to client.get_pow_challenge
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self._total_prefetched = 0
+        self._total_expired = 0
+        self._total_hits = 0
+        self._total_misses = 0
+
+    def start(self, get_challenge_fn) -> None:
+        """Start the background prefetch loop."""
+        if self._running:
+            return
+        self._get_challenge = get_challenge_fn
+        self._running = True
+        self._task = asyncio.create_task(self._prefetch_loop())
+        log.info(f"PoW prefetch pool started (size={self._pool_size})")
+
+    async def stop(self) -> None:
+        """Stop the prefetch loop."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _prefetch_loop(self) -> None:
+        """Background loop that keeps the queue topped up."""
+        while self._running:
+            try:
+                if self._queue.qsize() < self._pool_size:
+                    challenge = await self._get_challenge()
+                    solution = await solve_pow_async(challenge)
+                    expire_at = challenge.get("expire_at", 0)
+                    await self._queue.put((challenge, solution))
+                    self._total_prefetched += 1
+                    log.debug(
+                        f"PoW prefetched (queue={self._queue.qsize()}, "
+                        f"expires={expire_at})"
+                    )
+                else:
+                    await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(f"PoW prefetch error: {e}")
+                await asyncio.sleep(5.0)
+
+    async def get_or_solve(self, get_challenge_fn) -> tuple[dict, str]:
+        """Get a pre-solved PoW, or solve one inline if none available.
+
+        Returns (challenge_data, pow_response_b64).
+        """
+        # Try to grab a pre-solved one
+        while not self._queue.empty():
+            try:
+                challenge, solution = self._queue.get_nowait()
+                # Check if still valid
+                expire_at = challenge.get("expire_at", 0)
+                if time.time() < expire_at - self._safety_margin:
+                    self._total_hits += 1
+                    return challenge, solution
+                else:
+                    self._total_expired += 1
+                    log.debug("Discarded expired PoW from pool")
+            except asyncio.QueueEmpty:
+                break
+
+        # No valid pre-solved available — solve inline
+        self._total_misses += 1
+        challenge = await get_challenge_fn()
+        solution = await solve_pow_async(challenge)
+        return challenge, solution
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "pool_size": self._pool_size,
+            "queued": self._queue.qsize(),
+            "total_prefetched": self._total_prefetched,
+            "hits": self._total_hits,
+            "misses": self._total_misses,
+            "expired": self._total_expired,
+        }
+
+
+# ============================================================================
 # DeepSeek Async Client
 # ============================================================================
 class DeepSeekClient:
@@ -229,6 +332,7 @@ class DeepSeekClient:
         self.email = email
         self.password = password
         self._client: Optional[httpx.AsyncClient] = None
+        self._pow_pool: Optional[PoWPool] = None
         # Request tracking
         self.total_requests = 0
         self.successful_requests = 0
@@ -344,8 +448,13 @@ class DeepSeekClient:
         """Create session, solve PoW, build payload. Returns (payload, pow_response, session_id)."""
         chat_session_id = await self.create_session()
         prompt = self._messages_to_prompt(messages)
-        challenge = await self.get_pow_challenge()
-        pow_response = await solve_pow_async(challenge)
+
+        # Use PoW pool if available, otherwise solve inline
+        if self._pow_pool:
+            _, pow_response = await self._pow_pool.get_or_solve(self.get_pow_challenge)
+        else:
+            challenge = await self.get_pow_challenge()
+            pow_response = await solve_pow_async(challenge)
 
         payload = {
             "chat_session_id": chat_session_id,
@@ -455,6 +564,13 @@ class DeepSeekClient:
 
         req_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
+        # Detect truncation: if content hit the model's typical output limit
+        # without a natural ending, signal length-based truncation so callers
+        # (e.g. auto_continue) can request a continuation.
+        finish = "stop"
+        if len(content) > 15000 and not content.rstrip().endswith((".", "!", "?", "```", "---")):
+            finish = "length"
+
         return {
             "id": req_id,
             "object": "chat.completion",
@@ -464,7 +580,7 @@ class DeepSeekClient:
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
+                    "finish_reason": finish,
                 }
             ],
             "usage": {
@@ -663,7 +779,7 @@ class DeepSeekClient:
 
     def get_stats(self) -> dict:
         uptime = time.time() - self.start_time
-        return {
+        stats = {
             "uptime_seconds": round(uptime, 1),
             "total_requests": self.total_requests,
             "successful": self.successful_requests,
@@ -672,6 +788,20 @@ class DeepSeekClient:
             "auth_mode": "email/password" if self.can_auto_login else "manual token",
             "requests_per_minute": round(self.successful_requests / max(uptime / 60, 0.01), 2),
         }
+        if self._pow_pool:
+            stats["pow_pool"] = self._pow_pool.stats
+        return stats
+
+    def start_pow_pool(self, pool_size: int = 3) -> None:
+        """Start the PoW prefetch pool for reduced request latency."""
+        if self._pow_pool is None:
+            self._pow_pool = PoWPool(pool_size=pool_size)
+        self._pow_pool.start(self.get_pow_challenge)
+
+    async def stop_pow_pool(self) -> None:
+        """Stop the PoW prefetch pool."""
+        if self._pow_pool:
+            await self._pow_pool.stop()
 
 
 # ============================================================================
@@ -721,6 +851,11 @@ async def startup():
         else:
             log.error("Set DEEPSEEK_EMAIL+DEEPSEEK_PASSWORD, DEEPSEEK_TOKEN, or run grab_token.py")
             return
+
+    # Start PoW prefetch pool for reduced latency under concurrent load
+    pow_pool_size = int(os.environ.get("POW_POOL_SIZE", "3"))
+    if pow_pool_size > 0:
+        client.start_pow_pool(pool_size=pow_pool_size)
 
 
 @app.get("/v1/models")

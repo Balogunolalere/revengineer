@@ -50,3 +50,20 @@ evidence/
 
 # Token files (NEVER commit secrets)
 *.token
+
+# Instagram session files (contain auth cookies)
+ig_settings*.json
+
+# Bot state files (per-user, regenerated at runtime)
+liked_posts.json
+commented_posts.json
+dm_sent.json
+
+# Environment secrets
+.env
+
+# Test / debug logs
+*.log
+test_mobile_dm.log
+test_mobile_login.log
+debug_swarm_output.py
