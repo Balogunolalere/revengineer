@@ -67,3 +67,5 @@ dm_sent.json
 test_mobile_dm.log
 test_mobile_login.log
 debug_swarm_output.py
+
+*.json

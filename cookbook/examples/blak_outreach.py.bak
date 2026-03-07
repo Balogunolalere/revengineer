@@ -45,18 +45,13 @@ Usage:
     python -m cookbook.examples.blak_outreach --hashtags "webdesign,startup" --no-follow --dry-run
 """
 
-import argparse
 import asyncio
-import datetime
-import ipaddress
 import json
-import logging
 import os
-import random
-import re
-import socket
 import sys
-from urllib.parse import urlparse
+import random
+import logging
+import re
 
 from dotenv import load_dotenv
 load_dotenv()  # auto-load .env from project root
@@ -83,26 +78,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefm
 logging.getLogger("instagrapi").setLevel(logging.WARNING)
 logging.getLogger("public_request").setLevel(logging.WARNING)
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
-
-
-# ── Shared constants (Fix 13: single definition) ─────────────────
-
-SOCIAL_DOMAINS = [
-    "instagram.com", "facebook.com", "twitter.com", "tiktok.com",
-    "youtube.com", "wa.me", "t.me", "snapchat.com", "whatsapp.com",
-    "threads.net", "x.com", "linkedin.com", "pinterest.com",
-    "play.google.com", "apps.apple.com", "open.spotify.com",
-    "music.apple.com", "soundcloud.com", "tidal.com",
-]
-
-LINK_IN_BIO_SERVICES = [
-    "linktr.ee", "linktree.com", "bio.link", "linkbio.co", "tap.bio",
-    "campsite.bio", "solo.to", "carrd.co", "beacons.ai", "lnk.bio",
-    "milkshake.app", "stan.store", "hoo.be", "snipfeed.co", "flowpage.com",
-]
-
-# Maximum post age — ignore posts older than this
-MAX_POST_AGE_DAYS = 180  # 6 months
 
 
 # ── BlakStudio services ──────────────────────────────────────────
@@ -260,7 +235,6 @@ def _build_vision_slots() -> list[VisionSlot]:
 
 VISION_SLOTS: list[VisionSlot] = _build_vision_slots()
 _slot_idx = 0  # round-robin index across all slots
-_slot_lock = asyncio.Lock()  # Fix 5: protect round-robin from concurrent access
 
 # backward compat
 VISION_API_KEYS: list[str] = OPENROUTER_API_KEYS or [""]
@@ -272,111 +246,12 @@ VISION_DESCRIBE_PROMPT = """Describe this Instagram post image in 1-2 sentences.
 - Any text overlays visible
 Be concise and factual."""
 
-
-# ── Shared HTTP client (Fix 4) ───────────────────────────────────
-
-_http_pool: httpx.AsyncClient | None = None
-
-async def _get_http_client() -> httpx.AsyncClient:
-    """Return a shared httpx client with connection pooling."""
-    global _http_pool
-    if _http_pool is None or _http_pool.is_closed:
-        _http_pool = httpx.AsyncClient(timeout=30, follow_redirects=True)
-    return _http_pool
-
-
-# ── SSRF protection (Fix 3) ──────────────────────────────────────
-
-def _is_safe_url(url: str) -> bool:
-    """Return False if URL targets private/reserved/internal IPs."""
-    try:
-        parsed = urlparse(url)
-        hostname = parsed.hostname
-        if not hostname:
-            return False
-        infos = socket.getaddrinfo(hostname, None)
-        for info in infos:
-            ip = ipaddress.ip_address(info[4][0])
-            if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
-                return False
-        return True
-    except Exception:
-        return False
-
-
-# ── Adaptive throttle (Fix 14) ───────────────────────────────────
-
-class _ThrottleState:
-    """Tracks consecutive errors and adjusts sleep durations adaptively."""
-    def __init__(self):
-        self.consecutive_errors = 0
-        self.multiplier = 1.0
-
-    def on_success(self):
-        self.consecutive_errors = 0
-        self.multiplier = max(1.0, self.multiplier * 0.8)
-
-    def on_error(self):
-        self.consecutive_errors += 1
-        self.multiplier = min(5.0, self.multiplier * 1.5)
-
-    def sleep(self, low: float, high: float) -> float:
-        return random.uniform(low * self.multiplier, high * self.multiplier)
-
-_throttle = _ThrottleState()
-
-
-# ── JSON extraction (Fix 8) ──────────────────────────────────────
-
-def _extract_json(raw: str, expect_array: bool = False):
-    """Extract JSON object/array from LLM response, ignoring markdown fences/prose."""
-    if not raw:
-        return None
-    pattern = r'\[.*\]' if expect_array else r'\{.*\}'
-    match = re.search(pattern, raw, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-    try:
-        return json.loads(raw.strip())
-    except json.JSONDecodeError:
-        return None
-
-
-# ── Stats / dedup helpers (Fixes 2, 12, 15) ──────────────────────
-
-def _new_stats() -> dict:
-    return {
-        "posts": 0, "liked": 0, "skipped": 0, "qualified": 0,
-        "dm_sent": 0, "dm_drafted": 0, "dm_skipped": 0,
-        "commented": 0, "followed": 0, "failed": 0,
-        "vision_failures": 0,
-    }
-
-async def _load_dedup_sets(bridge: InstagrapiBridge) -> dict:
-    """Load liked/commented/DMed sets once per pass (Fix 2)."""
-    liked_data = json.loads(await bridge.get_liked_posts())
-    commented_data = json.loads(await bridge.get_commented_posts())
-    dm_data = json.loads(await bridge.get_dm_sent())
-    return {
-        "liked": set(str(i) for i in liked_data.get("liked_ids", [])),
-        "commented": set(str(i) for i in commented_data.get("commented_ids", [])),
-        "dmed": set(str(i) for i in dm_data.get("dm_sent_ids", [])),
-    }
-
-
-# ── LLM helpers ───────────────────────────────────────────────────
-
 async def llm_call(config: SwarmConfig, system: str, user_msg: str, max_tokens: int = 200, temp: float = 0.7) -> str | None:
-    """Generic DeepSeek text completion call (Fix 4: uses shared HTTP client)."""
+    """Generic DeepSeek text completion call."""
     api_base = config.api_base or "http://localhost:8000/v1"
     try:
-        client = await _get_http_client()
-        resp = await client.post(
-            f"{api_base}/chat/completions",
-            json={
+        async with httpx.AsyncClient(base_url=api_base, timeout=45) as client:
+            resp = await client.post("/chat/completions", json={
                 "model": config.default_model,
                 "messages": [
                     {"role": "system", "content": system},
@@ -385,31 +260,23 @@ async def llm_call(config: SwarmConfig, system: str, user_msg: str, max_tokens: 
                 "temperature": temp,
                 "max_tokens": max_tokens,
                 "stream": False,
-            },
-            timeout=45,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+            })
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         log.warning(f"LLM call failed: {e}")
         return None
 
 
-async def describe_image(image_url: str, stats: dict | None = None) -> str | None:
+async def describe_image(image_url: str) -> str | None:
     """Use OpenRouter + NVIDIA NIM vision models to describe an image.
 
-    Rotates through all provider/model/key slots round-robin (Fix 5: lock-protected).
+    Rotates through all provider/model/key slots round-robin.
     On 429 or failure, advances to the next slot.
-    Fix 15: tracks vision_failures in stats when all slots are exhausted.
     """
     global _slot_idx
     if not VISION_SLOTS or not image_url:
-        return None
-
-    # Fix 3: SSRF check on image URL
-    if not _is_safe_url(image_url):
-        log.warning(f"Blocked unsafe image URL: {image_url[:80]}")
         return None
 
     payload = {
@@ -424,36 +291,28 @@ async def describe_image(image_url: str, stats: dict | None = None) -> str | Non
         "stream": False,
     }
 
-    client = await _get_http_client()
-
     for attempt in range(len(VISION_SLOTS)):
-        # Fix 5: lock protects round-robin index from concurrent access
-        async with _slot_lock:
-            base_url, model, api_key, extra_headers = VISION_SLOTS[_slot_idx % len(VISION_SLOTS)]
-            _slot_idx = (_slot_idx + 1) % len(VISION_SLOTS)
+        base_url, model, api_key, extra_headers = VISION_SLOTS[_slot_idx % len(VISION_SLOTS)]
+        _slot_idx = (_slot_idx + 1) % len(VISION_SLOTS)
 
         headers = {"Authorization": f"Bearer {api_key}", **extra_headers}
         provider = "NVIDIA" if "nvidia" in base_url else "OR"
         short_name = model.split('/')[-1]
         try:
-            resp = await client.post(
-                f"{base_url}/chat/completions",
-                json={"model": model, **payload},
-                headers=headers,
-                timeout=45,
-            )
-            if resp.status_code == 429:
-                log.warning(f"Vision 429 on {short_name} ({provider}), rotating...")
-                await asyncio.sleep(1)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"].get("content")
-            if not content:
-                continue
-            desc = content.strip()
-            console.print(f"         [dim]👁️  Vision ({provider}/{short_name}): {desc[:70]}...[/dim]")
-            return desc
+            async with httpx.AsyncClient(base_url=base_url, timeout=45, headers=headers) as client:
+                resp = await client.post("/chat/completions", json={"model": model, **payload})
+                if resp.status_code == 429:
+                    log.warning(f"Vision 429 on {short_name} ({provider}), rotating...")
+                    await asyncio.sleep(1)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"].get("content")
+                if not content:
+                    continue
+                desc = content.strip()
+                console.print(f"         [dim]👁️  Vision ({provider}/{short_name}): {desc[:70]}...[/dim]")
+                return desc
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
                 await asyncio.sleep(1)
@@ -463,11 +322,6 @@ async def describe_image(image_url: str, stats: dict | None = None) -> str | Non
         except Exception as e:
             log.warning(f"Vision failed ({provider}/{short_name}): {e}")
             continue
-
-    # Fix 15: log + track when all vision slots are exhausted
-    log.warning("All vision slots exhausted — no image description available")
-    if stats is not None:
-        stats["vision_failures"] = stats.get("vision_failures", 0) + 1
     return None
 
 
@@ -475,48 +329,67 @@ async def verify_no_website(username: str, full_name: str, biography: str, exter
     """Verify a business truly doesn't have a website by checking their links more carefully.
 
     Returns: {"has_website": bool, "url_found": str, "method": str}
-    Fix 3: SSRF-safe — validates URLs against private IPs before fetching.
-    Fix 4: uses shared HTTP client.
-    Fix 13: uses module-level SOCIAL_DOMAINS / LINK_IN_BIO_SERVICES.
     """
-    client = await _get_http_client()
-
     # 1) If they have a real external_url, check if it's a legit domain (not linktree etc.)
+    link_in_bio_services = [
+        "linktr.ee", "linktree.com", "bio.link", "linkbio.co", "tap.bio",
+        "campsite.bio", "solo.to", "carrd.co", "beacons.ai", "lnk.bio",
+        "milkshake.app", "stan.store", "hoo.be", "snipfeed.co", "flowpage.com",
+    ]
+
     if external_url:
         url_lower = external_url.lower()
-        is_link_in_bio = any(svc in url_lower for svc in LINK_IN_BIO_SERVICES)
+        is_link_in_bio = any(svc in url_lower for svc in link_in_bio_services)
         if not is_link_in_bio:
             # They have a real website
             return {"has_website": True, "url_found": external_url, "method": "instagram_profile"}
 
-        # It's a link-in-bio page — scrape it for real website links (with SSRF check)
-        if _is_safe_url(external_url):
-            try:
-                resp = await client.get(external_url, timeout=12)
+        # It's a link-in-bio page — scrape it for real website links
+        try:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+                resp = await client.get(external_url)
                 if resp.status_code < 400:
                     page = resp.text.lower()
+                    # Pull all hrefs from the page
                     href_pattern = r'href=["\']?(https?://[^"\'<>\s]+)'
                     found_urls = re.findall(href_pattern, page)
+                    social_domains = [
+                        "instagram.com", "facebook.com", "twitter.com", "tiktok.com",
+                        "youtube.com", "wa.me", "t.me", "snapchat.com", "whatsapp.com",
+                        "threads.net", "x.com", "linkedin.com", "pinterest.com",
+                        "play.google.com", "apps.apple.com", "open.spotify.com",
+                        "music.apple.com", "soundcloud.com", "tidal.com",
+                    ]
                     for href in found_urls:
                         href_lower = href.lower()
-                        if any(s in href_lower for s in SOCIAL_DOMAINS + LINK_IN_BIO_SERVICES):
+                        # Skip social media, the link-in-bio service itself, and common junk
+                        if any(s in href_lower for s in social_domains + link_in_bio_services):
                             continue
                         if any(href_lower.endswith(ext) for ext in [".png", ".jpg", ".svg", ".css", ".js"]):
                             continue
+                        # Found a real website link
                         return {"has_website": True, "url_found": href, "method": "linkinbio_scrape"}
-            except Exception:
-                pass  # If scrape fails, continue with other checks
+        except Exception:
+            pass  # If scrape fails, continue with other checks
 
     # 2) Check their bio for website mentions
     if biography:
         bio_lower = biography.lower()
+        # Look for domain patterns in bio (e.g., "mybrand.com", "www.shop.ng")
         domain_pattern = r'(?:https?://)?(?:www\.)?([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?)'
         domains_in_bio = re.findall(domain_pattern, bio_lower)
         for domain in domains_in_bio:
-            if not any(s in domain for s in SOCIAL_DOMAINS + LINK_IN_BIO_SERVICES):
+            # Filter out social media domains — those aren't business websites
+            social_domains = [
+                "instagram.com", "facebook.com", "twitter.com", "tiktok.com",
+                "youtube.com", "wa.me", "t.me", "snapchat.com", "whatsapp.com",
+                "threads.net", "x.com",
+            ]
+            if not any(s in domain for s in social_domains + link_in_bio_services):
                 return {"has_website": True, "url_found": domain, "method": "bio_text"}
 
-    # 3) Domain probing — SSRF-safe, with capped timeouts (Fix 3)
+    # 3) Quick Google-like check: try to fetch common domain patterns
+    #    e.g., if username is "komfort.place", try "komfort.place" or "komfortplace.com"
     clean_name = re.sub(r'[^a-zA-Z0-9]', '', username.lower())
     candidate_domains = [
         f"{clean_name}.com",
@@ -524,52 +397,50 @@ async def verify_no_website(username: str, full_name: str, biography: str, exter
         f"{clean_name}.co",
         f"{clean_name}.store",
     ]
+    # Also try the username with dots preserved
     if "." in username:
         candidate_domains.insert(0, username.lower())
 
     for domain in candidate_domains:
-        for scheme in ("https", "http"):
-            probe_url = f"{scheme}://{domain}"
-            if not _is_safe_url(probe_url):
-                continue
-            try:
-                resp = await asyncio.wait_for(
-                    client.head(probe_url, timeout=6),
-                    timeout=8,
-                )
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+                resp = await client.head(f"https://{domain}")
                 if resp.status_code < 400:
-                    return {"has_website": True, "url_found": probe_url, "method": "domain_probe"}
-            except Exception:
-                pass
+                    return {"has_website": True, "url_found": f"https://{domain}", "method": "domain_probe"}
+        except Exception:
+            pass
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+                resp = await client.head(f"http://{domain}")
+                if resp.status_code < 400:
+                    return {"has_website": True, "url_found": f"http://{domain}", "method": "domain_probe"}
+        except Exception:
+            pass
 
     return {"has_website": False, "url_found": "", "method": "none_found"}
 
 
 async def qualify_profile(profile: dict, config: SwarmConfig) -> dict | None:
-    """Ask LLM if this profile is worth reaching out to.
-
-    Fix 8: uses _extract_json for robust parsing.
-    Fix 9: retries once on transient failure.
-    """
+    """Ask LLM if this profile is worth reaching out to. Returns qualification dict or None."""
     user_msg = json.dumps(profile, indent=2)
+    raw = await llm_call(config, QUALIFY_SYSTEM, user_msg, max_tokens=300, temp=0.3)
+    if not raw:
+        return None
 
-    for attempt in range(2):
-        raw = await llm_call(config, QUALIFY_SYSTEM, user_msg, max_tokens=300, temp=0.3)
-        if not raw:
-            if attempt == 0:
-                await asyncio.sleep(2)
-                continue
-            return None
+    # Parse JSON from response (handle markdown fences)
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
 
-        result = _extract_json(raw)
-        if isinstance(result, dict):
-            return result
-
-        log.warning(f"Failed to parse qualification (attempt {attempt + 1}): {raw[:100]}")
-        if attempt == 0:
-            await asyncio.sleep(1)
-
-    return None
+    try:
+        result = json.loads(text)
+        return result
+    except json.JSONDecodeError:
+        log.warning(f"Failed to parse qualification: {raw[:100]}")
+        return None
 
 
 async def generate_dm(profile: dict, qualification: dict, config: SwarmConfig) -> str | None:
@@ -592,15 +463,12 @@ async def generate_dm(profile: dict, qualification: dict, config: SwarmConfig) -
 async def generate_comment(
     caption: str, username: str, config: SwarmConfig,
     media_type: str = "", thumbnail_url: str = "",
-    stats: dict | None = None,
 ) -> str | None:
-    """Generate a comment with optional image analysis via vision API.
-
-    Fix 15: passes stats to describe_image for vision failure tracking.
-    """
+    """Generate a comment with optional image analysis via vision API."""
+    # Try vision analysis
     image_desc = None
     if thumbnail_url:
-        image_desc = await describe_image(thumbnail_url, stats=stats)
+        image_desc = await describe_image(thumbnail_url)
 
     # Build context
     parts = [f"Username: @{username}"]
@@ -626,25 +494,34 @@ async def generate_comment(
 
 
 async def discover_hashtags(config: SwarmConfig) -> list[str]:
-    """Use AI to generate smart hashtags for finding potential customers.
-
-    Fix 8: uses _extract_json for robust parsing.
-    """
+    """Use AI to generate smart hashtags for finding potential customers."""
     user_msg = (
         f"Generate 8 Instagram hashtags for finding potential BlakStudio customers. "
-        f"Current date: {datetime.date.today()}. "
+        f"Current date: {__import__('datetime').date.today()}. "
         f"Mix industries: real estate, fashion, food, beauty, events, tech startups, vendors. "
         f"Focus on Nigerian/African small businesses that need websites, branding, or digital presence."
     )
     raw = await llm_call(config, HASHTAG_SYSTEM, user_msg, max_tokens=200, temp=0.9)
     if not raw:
+        # Fallback to a reliable default set
         return ["lagosvendor", "abujabusiness", "nigerianbusiness", "lagosentrepreneur"]
 
-    tags = _extract_json(raw, expect_array=True)
-    if isinstance(tags, list) and all(isinstance(t, str) for t in tags):
-        cleaned = [t.strip().replace("#", "").lower() for t in tags if t.strip()]
-        return cleaned[:8]
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
 
+    try:
+        tags = json.loads(text)
+        if isinstance(tags, list) and all(isinstance(t, str) for t in tags):
+            cleaned = [t.strip().replace("#", "").lower() for t in tags if t.strip()]
+            return cleaned[:8]
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback
     return ["lagosvendor", "abujabusiness", "nigerianbusiness", "lagosentrepreneur"]
 
 
@@ -710,202 +587,11 @@ def make_stats_table(stats: dict, total: dict, loop_count: int):
     rows = [
         ("Posts", "posts"), ("Liked", "liked"), ("Commented", "commented"),
         ("Followed", "followed"), ("Qualified", "qualified"), ("DMs Sent", "dm_sent"),
-        ("DM Drafted", "dm_drafted"), ("DM Skipped", "dm_skipped"),
-        ("Skipped", "skipped"), ("Failed", "failed"),
-        ("Vision Fail", "vision_failures"),
+        ("DM Skipped", "dm_skipped"), ("Skipped", "skipped"), ("Failed", "failed"),
     ]
     for label, key in rows:
         table.add_row(label, str(stats.get(key, 0)), str(total.get(key, 0)))
     return table
-
-
-# ── Shared post pipeline (Fix 1: DRY) ─────────────────────────────
-
-async def _process_post(
-    media_id: str, user: str, url: str, caption: str,
-    media_type: str, thumbnail_url: str, has_liked: bool,
-    bridge: InstagrapiBridge, config: SwarmConfig,
-    dedup: dict, processed_users: set, stats: dict,
-    do_comment: bool, do_follow: bool, dry_run: bool,
-    progress_label: str, taken_at: int = 0,
-) -> None:
-    """Shared pipeline: like → comment → qualify → verify → follow → DM.
-
-    Fixes: 1 (DRY), 6 (skip already-processed before like), 7 (update dedup),
-    12 (dm_drafted), 14 (adaptive throttle), 15 (vision tracking), 16 (vision for hashtags).
-    """
-    already_liked = dedup["liked"]
-    already_commented = dedup["commented"]
-    already_dmed = dedup["dmed"]
-
-    # Skip posts older than 6 months
-    if taken_at:
-        try:
-            post_time = datetime.datetime.fromtimestamp(int(taken_at), tz=datetime.timezone.utc)
-            age = datetime.datetime.now(datetime.timezone.utc) - post_time
-            if age.days > MAX_POST_AGE_DAYS:
-                console.print(f"  {progress_label} [dim]OLD[/dim]  @{user} — {age.days}d old, skipping")
-                stats["skipped"] += 1
-                return
-        except (ValueError, OSError, OverflowError):
-            pass  # invalid timestamp — continue processing
-
-    # Fix 6: skip liking posts from already-processed users
-    if user in processed_users:
-        stats["skipped"] += 1
-        return
-    processed_users.add(user)
-
-    # ── Like ──
-    if media_id in already_liked or has_liked:
-        console.print(f"  {progress_label} [dim]SKIP[/dim]  @{user}")
-        stats["skipped"] += 1
-    else:
-        result = await bridge.like_post(media_id=media_id)
-        if "[SUCCESS]" in result:
-            stats["liked"] += 1
-            already_liked.add(media_id)  # Fix 7
-            console.print(f"  {progress_label} [red]❤️  LIKED[/red] [bold]@{user}[/bold] — [dim]{url or media_id}[/dim]")
-            _throttle.on_success()
-        elif "[SKIP]" in result:
-            stats["skipped"] += 1
-            console.print(f"  {progress_label} [dim]SKIP[/dim]  @{user}")
-        else:
-            stats["failed"] += 1
-            _throttle.on_error()
-            console.print(f"  {progress_label} [bold red]FAIL[/bold red]  @{user} — {result}")
-        await asyncio.sleep(_throttle.sleep(1.0, 2.0))
-
-    # ── Comment (with vision) ── Fix 16: always pass media_type + thumbnail_url
-    if do_comment and media_id not in already_commented:
-        comment = await generate_comment(
-            caption, user, config,
-            media_type=media_type, thumbnail_url=thumbnail_url,
-            stats=stats,
-        )
-        if comment:
-            result = await bridge.comment_post(media_id=media_id, text=comment)
-            if "[SUCCESS]" in result:
-                stats["commented"] += 1
-                already_commented.add(media_id)
-                console.print(f"         [cyan]💬[/cyan] [italic]\"{comment}\"[/italic] — [dim]{url}[/dim]")
-                _throttle.on_success()
-            else:
-                _throttle.on_error()
-            await asyncio.sleep(_throttle.sleep(2.0, 3.5))
-
-    # ── Qualify + DM ──
-    with console.status(f"[dim]Checking @{user}...[/dim]", spinner="point"):
-        profile_raw = await bridge.get_business_profile(username=user)
-    if "[ERROR]" in profile_raw:
-        return
-
-    profile = json.loads(profile_raw)
-    user_id = profile.get("user_id", "")
-
-    if user_id in already_dmed:
-        console.print(f"         [dim]📩 Already DMed @{user}[/dim]")
-        stats["dm_skipped"] += 1
-        return
-
-    # AI qualification (Fix 9: retries inside qualify_profile)
-    qual = await qualify_profile(profile, config)
-    if not qual:
-        return
-
-    qualify_decision = qual.get("qualify", "NO").upper()
-    reason = qual.get("reason", "")
-    services = qual.get("services_needed", [])
-    priority = qual.get("priority", "low")
-
-    if qualify_decision != "YES":
-        console.print(f"         [dim red]✖ NOT QUALIFIED @{user}: {reason}[/dim red]")
-        return
-
-    stats["qualified"] += 1
-
-    # ── Website Verification ──
-    external_url = profile.get("external_url", "")
-    biography = profile.get("biography", "")
-    full_name = profile.get("full_name", "")
-
-    with console.status(f"[dim]Verifying website for @{user}...[/dim]", spinner="point"):
-        web_check = await verify_no_website(user, full_name, biography, external_url)
-
-    if web_check["has_website"]:
-        found_url = web_check["url_found"]
-        method = web_check["method"]
-        console.print(
-            f"         [yellow]🌐 WEBSITE FOUND[/yellow] @{user}: "
-            f"[link={found_url}]{found_url}[/link] [dim](via {method})[/dim]"
-        )
-        for svc in ["website", "ecommerce"]:
-            if svc in services:
-                services.remove(svc)
-        if not services:
-            console.print(f"         [dim]Skipping — already has website, no other services needed[/dim]")
-            return
-        qual["services_needed"] = services
-        qual["has_website"] = found_url
-        qual["reason"] = f"Has website ({found_url}) but still needs: {', '.join(services)}"
-    else:
-        console.print(f"         [green]✓ No website confirmed[/green] for @{user}")
-
-    priority_colors = {"high": "bold red", "medium": "yellow", "low": "dim"}
-    pcolor = priority_colors.get(priority, "white")
-    console.print(
-        f"         [green]✅ QUALIFIED[/green] [bold]@{user}[/bold] "
-        f"[{pcolor}][{priority.upper()}][/{pcolor}] — needs: [cyan]{', '.join(services)}[/cyan]"
-    )
-    console.print(f"         [dim]{reason}[/dim]")
-
-    # ── Follow qualified account ──
-    if do_follow and user_id:
-        follow_result = await bridge.follow_user(user_id=user_id)
-        if "[SUCCESS]" in follow_result:
-            stats["followed"] += 1
-            console.print(f"         [magenta]👤 FOLLOWED[/magenta] @{user}")
-            _throttle.on_success()
-            await asyncio.sleep(_throttle.sleep(1.0, 2.0))
-
-    # ── Generate personalized DM ──
-    dm_text = await generate_dm(profile, qual, config)
-    if not dm_text:
-        console.print(f"         [dim]⏭️  Skipped DM (generator returned skip)[/dim]")
-        return
-
-    if dry_run:
-        console.print(Panel(
-            dm_text,
-            title=f"[yellow]DRY RUN DM → @{user}[/yellow]",
-            border_style="yellow",
-            box=box.ROUNDED,
-            padding=(0, 1),
-        ))
-        stats["dm_drafted"] += 1  # Fix 12: separate stat for dry-run
-        return
-
-    # Send the DM
-    result = await bridge.send_dm(user_id=user_id, text=dm_text)
-    if "[SUCCESS]" in result:
-        stats["dm_sent"] += 1
-        _throttle.on_success()
-        console.print(Panel(
-            dm_text,
-            title=f"[green]📩 DM SENT → @{user}[/green]",
-            border_style="green",
-            box=box.ROUNDED,
-            padding=(0, 1),
-        ))
-    elif "[SKIP]" in result:
-        stats["dm_skipped"] += 1
-        console.print(f"         [dim]📩 Already DMed @{user}[/dim]")
-    else:
-        stats["failed"] += 1
-        _throttle.on_error()
-        console.print(f"         [bold red]❌ DM FAILED @{user}: {result}[/bold red]")
-
-    await asyncio.sleep(_throttle.sleep(3.0, 6.0))
 
 
 # ── Main outreach loop ────────────────────────────────────────────
@@ -913,14 +599,27 @@ async def _process_post(
 async def process_feed(
     bridge: InstagrapiBridge,
     config: SwarmConfig,
-    dedup: dict,
     do_comment: bool = True,
     dry_run: bool = False,
     do_follow: bool = False,
 ) -> dict:
-    """Single pass: fetch feed → shared pipeline per post (Fix 1 + 2)."""
-    stats = _new_stats()
-    processed_users: set[str] = set()
+    """Single pass: fetch feed → like → vision → qualify → verify website → DM → comment."""
+    stats = {
+        "posts": 0, "liked": 0, "skipped": 0, "qualified": 0,
+        "dm_sent": 0, "dm_skipped": 0, "commented": 0, "followed": 0, "failed": 0,
+    }
+
+    # Load dedup sets
+    liked_data = json.loads(await bridge.get_liked_posts())
+    already_liked = set(str(i) for i in liked_data.get("liked_ids", []))
+
+    commented_data = json.loads(await bridge.get_commented_posts())
+    already_commented = set(str(i) for i in commented_data.get("commented_ids", []))
+
+    dm_data = json.loads(await bridge.get_dm_sent())
+    already_dmed = set(str(i) for i in dm_data.get("dm_sent_ids", []))
+
+    processed_users = set()
 
     # Fetch feed with spinner (paginated — pulls multiple pages)
     with console.status("[bold cyan]Fetching timeline feed (paginated)...", spinner="dots"):
@@ -944,22 +643,162 @@ async def process_feed(
         has_liked = post.get("has_liked", False)
         media_type = post.get("media_type", "")
         thumbnail_url = post.get("thumbnail_url", "")
-        taken_at = post.get("taken_at", 0)
 
         if not media_id or not user:
             continue
 
         progress_label = f"[dim][{i}/{len(posts)}][/dim]"
 
-        await _process_post(
-            media_id=media_id, user=user, url=url, caption=caption,
-            media_type=media_type, thumbnail_url=thumbnail_url,
-            has_liked=has_liked, bridge=bridge, config=config,
-            dedup=dedup, processed_users=processed_users, stats=stats,
-            do_comment=do_comment, do_follow=do_follow,
-            dry_run=dry_run, progress_label=progress_label,
-            taken_at=taken_at,
+        # ── Like ──
+        if media_id in already_liked or has_liked:
+            console.print(f"  {progress_label} [dim]SKIP[/dim]  @{user}")
+            stats["skipped"] += 1
+        else:
+            result = await bridge.like_post(media_id=media_id)
+            if "[SUCCESS]" in result:
+                stats["liked"] += 1
+                console.print(f"  {progress_label} [red]❤️  LIKED[/red] [bold]@{user}[/bold] — [dim]{url or media_id}[/dim]")
+            elif "[SKIP]" in result:
+                stats["skipped"] += 1
+                console.print(f"  {progress_label} [dim]SKIP[/dim]  @{user}")
+            else:
+                stats["failed"] += 1
+                console.print(f"  {progress_label} [bold red]FAIL[/bold red]  @{user} — {result}")
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+
+        # ── Skip already-processed users early (before vision/comment) ──
+        if user in processed_users:
+            continue
+        processed_users.add(user)
+
+        # ── Comment (with vision) ──
+        if do_comment and media_id not in already_commented:
+            comment = await generate_comment(
+                caption, user, config,
+                media_type=media_type, thumbnail_url=thumbnail_url,
+            )
+            if comment:
+                result = await bridge.comment_post(media_id=media_id, text=comment)
+                if "[SUCCESS]" in result:
+                    stats["commented"] += 1
+                    console.print(f"         [cyan]💬[/cyan] [italic]\"{comment}\"[/italic] — [dim]{url}[/dim]")
+                await asyncio.sleep(random.uniform(2.0, 3.5))
+
+        # ── Qualify + DM ──
+
+        # Fetch business profile
+        with console.status(f"[dim]Checking @{user}...[/dim]", spinner="point"):
+            profile_raw = await bridge.get_business_profile(username=user)
+        if "[ERROR]" in profile_raw:
+            continue
+
+        profile = json.loads(profile_raw)
+        user_id = profile.get("user_id", "")
+
+        if user_id in already_dmed:
+            console.print(f"         [dim]📩 Already DMed @{user}[/dim]")
+            stats["dm_skipped"] += 1
+            continue
+
+        # AI qualification
+        qual = await qualify_profile(profile, config)
+        if not qual:
+            continue
+
+        qualify_decision = qual.get("qualify", "NO").upper()
+        reason = qual.get("reason", "")
+        services = qual.get("services_needed", [])
+        priority = qual.get("priority", "low")
+
+        if qualify_decision != "YES":
+            console.print(f"         [dim red]✖ NOT QUALIFIED @{user}: {reason}[/dim red]")
+            continue
+
+        stats["qualified"] += 1
+
+        # ── Website Verification ──
+        # Before DMing about websites, verify they truly don't have one
+        external_url = profile.get("external_url", "")
+        biography = profile.get("biography", "")
+        full_name = profile.get("full_name", "")
+
+        with console.status(f"[dim]Verifying website for @{user}...[/dim]", spinner="point"):
+            web_check = await verify_no_website(user, full_name, biography, external_url)
+
+        if web_check["has_website"]:
+            found_url = web_check["url_found"]
+            method = web_check["method"]
+            console.print(
+                f"         [yellow]🌐 WEBSITE FOUND[/yellow] @{user}: "
+                f"[link={found_url}]{found_url}[/link] [dim](via {method})[/dim]"
+            )
+            # Remove website-related services — they already have a site
+            for svc in ["website", "ecommerce"]:
+                if svc in services:
+                    services.remove(svc)
+            # If no services left, skip entirely
+            if not services:
+                console.print(f"         [dim]Skipping — already has website, no other services needed[/dim]")
+                continue
+            # Update qualification so the DM generator knows about the website
+            qual["services_needed"] = services
+            qual["has_website"] = found_url
+            qual["reason"] = f"Has website ({found_url}) but still needs: {', '.join(services)}"
+        else:
+            console.print(f"         [green]✓ No website confirmed[/green] for @{user}")
+
+        priority_colors = {"high": "bold red", "medium": "yellow", "low": "dim"}
+        pcolor = priority_colors.get(priority, "white")
+        console.print(
+            f"         [green]✅ QUALIFIED[/green] [bold]@{user}[/bold] "
+            f"[{pcolor}][{priority.upper()}][/{pcolor}] — needs: [cyan]{', '.join(services)}[/cyan]"
         )
+        console.print(f"         [dim]{reason}[/dim]")
+
+        # ── Follow qualified account ──
+        if do_follow and user_id:
+            follow_result = await bridge.follow_user(user_id=user_id)
+            if "[SUCCESS]" in follow_result:
+                stats["followed"] += 1
+                console.print(f"         [magenta]👤 FOLLOWED[/magenta] @{user}")
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+
+        # Generate personalized DM
+        dm_text = await generate_dm(profile, qual, config)
+        if not dm_text:
+            console.print(f"         [dim]⏭️  Skipped DM (generator returned skip)[/dim]")
+            continue
+
+        if dry_run:
+            console.print(Panel(
+                dm_text,
+                title=f"[yellow]DRY RUN DM → @{user}[/yellow]",
+                border_style="yellow",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            ))
+            stats["dm_sent"] += 1
+            continue
+
+        # Send the DM
+        result = await bridge.send_dm(user_id=user_id, text=dm_text)
+        if "[SUCCESS]" in result:
+            stats["dm_sent"] += 1
+            console.print(Panel(
+                dm_text,
+                title=f"[green]📩 DM SENT → @{user}[/green]",
+                border_style="green",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            ))
+        elif "[SKIP]" in result:
+            stats["dm_skipped"] += 1
+            console.print(f"         [dim]📩 Already DMed @{user}[/dim]")
+        else:
+            stats["failed"] += 1
+            console.print(f"         [bold red]❌ DM FAILED @{user}: {result}[/bold red]")
+
+        await asyncio.sleep(random.uniform(3.0, 6.0))
 
     return stats
 
@@ -970,13 +809,26 @@ async def process_hashtags(
     bridge: InstagrapiBridge,
     config: SwarmConfig,
     hashtags: list[str],
-    dedup: dict,
     do_comment: bool = True,
     dry_run: bool = False,
     do_follow: bool = False,
 ) -> dict:
-    """Scan hashtags for business leads via shared pipeline (Fix 1 + 2 + 16)."""
-    stats = _new_stats()
+    """Scan hashtags for business leads → qualify → like → comment → follow → DM."""
+    stats = {
+        "posts": 0, "liked": 0, "skipped": 0, "qualified": 0,
+        "dm_sent": 0, "dm_skipped": 0, "commented": 0, "followed": 0, "failed": 0,
+    }
+
+    # Load dedup sets
+    liked_data = json.loads(await bridge.get_liked_posts())
+    already_liked = set(str(i) for i in liked_data.get("liked_ids", []))
+
+    commented_data = json.loads(await bridge.get_commented_posts())
+    already_commented = set(str(i) for i in commented_data.get("commented_ids", []))
+
+    dm_data = json.loads(await bridge.get_dm_sent())
+    already_dmed = set(str(i) for i in dm_data.get("dm_sent_ids", []))
+
     processed_users: set[str] = set()
 
     for tag in hashtags:
@@ -1013,57 +865,144 @@ async def process_hashtags(
             code = post.get("code", "")
             caption = post.get("caption_text", post.get("caption", "")) or ""
             url = f"https://www.instagram.com/p/{code}/" if code else ""
-            # Fix 16: extract media_type + thumbnail_url for hashtag posts too
-            media_type = post.get("media_type", "")
-            thumbnail_url = post.get("thumbnail_url", "")
-            if not thumbnail_url:
-                # Hashtag feed sometimes nests images differently
-                candidates = post.get("image_versions2", {}).get("candidates", [])
-                if candidates:
-                    thumbnail_url = candidates[0].get("url", "")
-            taken_at = post.get("taken_at", 0)
 
             if not media_id or not user:
                 continue
 
             progress_label = f"[dim][#{tag} {i}/{len(posts)}][/dim]"
 
-            await _process_post(
-                media_id=media_id, user=user, url=url, caption=caption,
-                media_type=media_type, thumbnail_url=thumbnail_url,
-                has_liked=False, bridge=bridge, config=config,
-                dedup=dedup, processed_users=processed_users, stats=stats,
-                do_comment=do_comment, do_follow=do_follow,
-                dry_run=dry_run, progress_label=progress_label,
-                taken_at=taken_at,
+            # ── Like ──
+            if media_id in already_liked:
+                stats["skipped"] += 1
+            else:
+                result = await bridge.like_post(media_id=media_id)
+                if "[SUCCESS]" in result:
+                    stats["liked"] += 1
+                    console.print(f"  {progress_label} [red]❤️  LIKED[/red] [bold]@{user}[/bold] — [dim]{url}[/dim]")
+                    already_liked.add(media_id)
+                elif "[SKIP]" in result:
+                    stats["skipped"] += 1
+                else:
+                    stats["failed"] += 1
+                await asyncio.sleep(random.uniform(1.0, 2.5))
+
+            # ── Skip already-processed users early (before vision/comment) ──
+            if user in processed_users:
+                continue
+            processed_users.add(user)
+
+            # ── Comment ──
+            if do_comment and media_id not in already_commented:
+                comment = await generate_comment(caption, user, config)
+                if comment:
+                    result = await bridge.comment_post(media_id=media_id, text=comment)
+                    if "[SUCCESS]" in result:
+                        stats["commented"] += 1
+                        console.print(f"         [cyan]💬[/cyan] [italic]\"{comment}\"[/italic]")
+                        already_commented.add(media_id)
+                    await asyncio.sleep(random.uniform(2.0, 3.5))
+
+            # ── Qualify + DM (one per user) ──
+
+            with console.status(f"[dim]Checking @{user}...[/dim]", spinner="point"):
+                profile_raw = await bridge.get_business_profile(username=user)
+            if "[ERROR]" in profile_raw:
+                continue
+
+            profile = json.loads(profile_raw)
+            user_id = profile.get("user_id", "")
+
+            if user_id in already_dmed:
+                console.print(f"         [dim]📩 Already DMed @{user}[/dim]")
+                stats["dm_skipped"] += 1
+                continue
+
+            # AI qualification
+            qual = await qualify_profile(profile, config)
+            if not qual or qual.get("qualify", "NO").upper() != "YES":
+                reason = qual.get("reason", "N/A") if qual else "LLM failed"
+                console.print(f"         [dim red]✖ NOT QUALIFIED @{user}: {reason}[/dim red]")
+                continue
+
+            stats["qualified"] += 1
+            services = qual.get("services_needed", [])
+            priority = qual.get("priority", "low")
+
+            # Website verification
+            external_url = profile.get("external_url", "")
+            biography = profile.get("biography", "")
+            full_name = profile.get("full_name", "")
+
+            with console.status(f"[dim]Verifying website for @{user}...[/dim]", spinner="point"):
+                web_check = await verify_no_website(user, full_name, biography, external_url)
+
+            if web_check["has_website"]:
+                found_url = web_check["url_found"]
+                # Remove website-related services
+                for svc in ["website", "ecommerce"]:
+                    if svc in services:
+                        services.remove(svc)
+                if not services:
+                    continue
+                qual["services_needed"] = services
+                qual["has_website"] = found_url
+                qual["reason"] = f"Has website ({found_url}) but still needs: {', '.join(services)}"
+
+            priority_colors = {"high": "bold red", "medium": "yellow", "low": "dim"}
+            pcolor = priority_colors.get(priority, "white")
+            console.print(
+                f"         [green]✅ QUALIFIED[/green] [bold]@{user}[/bold] "
+                f"[{pcolor}][{priority.upper()}][/{pcolor}] — needs: [cyan]{', '.join(services)}[/cyan]"
             )
+
+            # Follow
+            if do_follow and user_id:
+                follow_result = await bridge.follow_user(user_id=user_id)
+                if "[SUCCESS]" in follow_result:
+                    stats["followed"] += 1
+                    console.print(f"         [magenta]👤 FOLLOWED[/magenta] @{user}")
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
+
+            # Generate + send DM
+            dm_text = await generate_dm(profile, qual, config)
+            if not dm_text:
+                continue
+
+            if dry_run:
+                console.print(Panel(
+                    dm_text,
+                    title=f"[yellow]DRY RUN DM → @{user}[/yellow]",
+                    border_style="yellow",
+                    box=box.ROUNDED,
+                    padding=(0, 1),
+                ))
+                stats["dm_sent"] += 1
+                continue
+
+            result = await bridge.send_dm(user_id=user_id, text=dm_text)
+            if "[SUCCESS]" in result:
+                stats["dm_sent"] += 1
+                console.print(Panel(
+                    dm_text,
+                    title=f"[green]📩 DM SENT → @{user}[/green]",
+                    border_style="green",
+                    box=box.ROUNDED,
+                    padding=(0, 1),
+                ))
+            elif "[SKIP]" in result:
+                stats["dm_skipped"] += 1
+            else:
+                stats["failed"] += 1
+                console.print(f"         [bold red]❌ DM FAILED @{user}: {result}[/bold red]")
+
+            await asyncio.sleep(random.uniform(3.0, 6.0))
 
     return stats
 
 
-# ── Entrypoint (Fix 10: argparse, Fix 11: specific exception handling) ─
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="BlakStudio.dev — Intelligent Instagram DM Outreach Bot",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--once", action="store_true", help="Run once and exit")
-    parser.add_argument("--interval", type=int, default=600, help="Loop interval in seconds (default: 600)")
-    parser.add_argument("--no-comment", action="store_true", help="Disable auto-commenting")
-    parser.add_argument("--dry-run", action="store_true", help="Generate DMs but don't send")
-    parser.add_argument("--no-follow", action="store_true", help="Disable auto-follow")
-    parser.add_argument("--no-hashtags", action="store_true", help="Disable hashtag discovery")
-    parser.add_argument(
-        "--hashtags", type=str, default="",
-        help="Comma-separated hashtags to search (e.g., 'smallbusiness,lagosvendor')",
-    )
-    return parser.parse_args()
-
+# ── Entrypoint ────────────────────────────────────────────────────
 
 async def main():
-    args = _parse_args()
-
     username = os.environ.get("IG_USERNAME", "")
     password = os.environ.get("IG_PASSWORD", "")
 
@@ -1071,18 +1010,40 @@ async def main():
         username = input("Instagram username: ").strip()
         password = input("Instagram password: ").strip()
 
-    do_follow = not args.no_follow
-    manual_hashtags = [
-        t.strip().replace("#", "") for t in args.hashtags.split(",") if t.strip()
-    ] if args.hashtags else []
+    once = "--once" in sys.argv
+    no_comment = "--no-comment" in sys.argv
+    dry_run = "--dry-run" in sys.argv
+    do_follow = "--no-follow" not in sys.argv  # ON by default
+    no_hashtags = "--no-hashtags" in sys.argv
+    interval = 600  # 10 min default
+
+    # Parse --hashtags "tag1,tag2,tag3" (manual override)
+    manual_hashtags: list[str] = []
+    for arg in sys.argv:
+        if arg.startswith("--hashtags"):
+            if "=" in arg:
+                manual_hashtags = [t.strip().replace("#", "") for t in arg.split("=", 1)[1].split(",") if t.strip()]
+            else:
+                idx = sys.argv.index(arg)
+                if idx + 1 < len(sys.argv):
+                    manual_hashtags = [t.strip().replace("#", "") for t in sys.argv[idx + 1].split(",") if t.strip()]
+
+    for arg in sys.argv:
+        if arg.startswith("--interval"):
+            if "=" in arg:
+                interval = int(arg.split("=")[1])
+            else:
+                idx = sys.argv.index(arg)
+                if idx + 1 < len(sys.argv):
+                    interval = int(sys.argv[idx + 1])
 
     # ── Beautiful startup ──
     console.print()
     console.print(make_banner())
     console.print()
     console.print(Align.center(make_config_table(
-        username, args.once, args.interval, args.no_comment, args.dry_run,
-        hashtags=(manual_hashtags or ["AI auto-discover"]) if not args.no_hashtags else None,
+        username, once, interval, no_comment, dry_run,
+        hashtags=(manual_hashtags or ["AI auto-discover"]) if not no_hashtags else None,
         do_follow=do_follow,
     )))
     if VISION_SLOTS:
@@ -1104,8 +1065,10 @@ async def main():
     console.print()
 
     loop_count = 0
-    total = _new_stats()
-    consecutive_pass_errors = 0
+    total = {
+        "posts": 0, "liked": 0, "skipped": 0, "qualified": 0,
+        "dm_sent": 0, "dm_skipped": 0, "commented": 0, "followed": 0, "failed": 0,
+    }
 
     while True:
         loop_count += 1
@@ -1113,20 +1076,17 @@ async def main():
         console.print()
 
         try:
-            # Fix 2: load dedup sets once per pass
-            dedup = await _load_dedup_sets(bridge)
-
             # ── Timeline feed ──
             console.print(Rule("[bold]Timeline Feed[/bold]", style="cyan"))
             feed_stats = await process_feed(
-                bridge, config, dedup,
-                do_comment=not args.no_comment, dry_run=args.dry_run, do_follow=do_follow,
+                bridge, config,
+                do_comment=not no_comment, dry_run=dry_run, do_follow=do_follow,
             )
             for k in total:
                 total[k] += feed_stats.get(k, 0)
 
             # ── Hashtag discovery ──
-            if not args.no_hashtags:
+            if not no_hashtags:
                 console.print()
                 console.print(Rule("[bold]Hashtag Discovery[/bold]", style="magenta"))
 
@@ -1141,8 +1101,8 @@ async def main():
                 console.print()
 
                 ht_stats = await process_hashtags(
-                    bridge, config, hashtags, dedup,
-                    do_comment=not args.no_comment, dry_run=args.dry_run, do_follow=do_follow,
+                    bridge, config, hashtags,
+                    do_comment=not no_comment, dry_run=dry_run, do_follow=do_follow,
                 )
                 for k in total:
                     total[k] += ht_stats.get(k, 0)
@@ -1153,33 +1113,13 @@ async def main():
             console.print()
             console.print(Align.center(make_stats_table(feed_stats, total, loop_count)))
             console.print()
-            consecutive_pass_errors = 0  # reset on success
-
-        # Fix 11: handle auth/connection errors specifically
-        except (ConnectionError, httpx.HTTPStatusError) as e:
-            consecutive_pass_errors += 1
-            console.print(f"[bold red]Connection error in pass #{loop_count}: {e}[/bold red]")
-            if consecutive_pass_errors >= 3:
-                console.print("[bold red]3 consecutive failures — attempting re-login...[/bold red]")
-                try:
-                    bridge.login()
-                    console.print("[green]Re-login successful[/green]")
-                    consecutive_pass_errors = 0
-                except Exception as login_err:
-                    console.print(f"[bold red]Re-login failed: {login_err}. Exiting.[/bold red]")
-                    break
         except Exception as e:
-            consecutive_pass_errors += 1
             console.print(f"[bold red]Error in pass #{loop_count}: {e}[/bold red]")
-            if consecutive_pass_errors >= 5:
-                console.print("[bold red]Too many consecutive errors. Exiting.[/bold red]")
-                break
 
-        if args.once:
+        if once:
             break
 
-        # Countdown timer — adaptive interval based on throttle state (Fix 14)
-        actual_interval = int(args.interval * _throttle.multiplier)
+        # Countdown timer
         console.print()
         with Progress(
             SpinnerColumn("dots"),
@@ -1189,16 +1129,11 @@ async def main():
             TextColumn("[dim]seconds[/dim]"),
             console=console,
         ) as progress:
-            task = progress.add_task("countdown", total=actual_interval)
-            for tick in range(actual_interval):
+            task = progress.add_task("countdown", total=interval)
+            for tick in range(interval):
                 await asyncio.sleep(1)
                 progress.update(task, advance=1)
         console.print()
-
-    # Cleanup shared HTTP client
-    global _http_pool
-    if _http_pool and not _http_pool.is_closed:
-        await _http_pool.aclose()
 
     # Final summary
     console.print(Rule("[bold green]Session Complete[/bold green]", style="green"))

@@ -60,7 +60,7 @@ class InstagrapiBridge:
         if not username:
             return "[ERROR] missing username"
         try:
-            user = await self._run_async(self.cl.user_info_by_username, username)
+            user = await self._run_async(self.cl.user_info_by_username_v1, username)
             return _to_json(getattr(user, "model_dump", user.dict)())
         except Exception as e:
             return f"[ERROR] Failed to fetch profile: {e}"
@@ -72,17 +72,63 @@ class InstagrapiBridge:
         hashtag = hashtag.replace("#", "")
         amount_int = int(amount) if str(amount).isdigit() else 27
         try:
-            medias = await self._run_async(self.cl.hashtag_medias_top, hashtag, amount_int)
+            # Call the raw private API directly to avoid instagrapi's Media
+            # Pydantic validation crash (missing 'code' field in hashtag results)
+            from instagrapi.extractors import extract_user_short
+            data = {
+                "media_recency_filter": "default",
+                "_uuid": self.cl.uuid,
+                "include_persistent": "false",
+                "rank_token": self.cl.rank_token,
+            }
+            raw = await self._run_async(
+                self.cl.private_request,
+                f"tags/{hashtag}/sections/",
+                data=data,
+                with_signature=False,
+            )
             results = []
-            for m in medias:
-                results.append({
-                    "id": m.pk,
-                    "code": m.code,
-                    "caption_text": m.caption_text,
-                    "user": getattr(m.user, "model_dump", m.user.dict)() if m.user else None,
-                    "like_count": m.like_count,
-                    "comment_count": m.comment_count
-                })
+            for section in raw.get("sections", []):
+                layout_content = section.get("layout_content") or {}
+                nodes = layout_content.get("medias") or []
+                for node in nodes:
+                    if len(results) >= amount_int:
+                        break
+                    m = node.get("media", {})
+                    caption = (m.get("caption") or {}).get("text", "")
+                    user_raw = m.get("user")
+                    user_data = None
+                    if user_raw:
+                        try:
+                            u = extract_user_short(user_raw)
+                            user_data = getattr(u, "model_dump", u.dict)()
+                        except Exception:
+                            user_data = {
+                                "pk": user_raw.get("pk"),
+                                "username": user_raw.get("username", ""),
+                                "full_name": user_raw.get("full_name", ""),
+                            }
+                    # Build code from shortcode or pk
+                    code = m.get("code", "") or m.get("shortcode", "")
+                    results.append({
+                        "id": m.get("pk", m.get("id", "")),
+                        "code": code,
+                        "caption_text": caption,
+                        "user": user_data,
+                        "like_count": m.get("like_count", 0),
+                        "comment_count": m.get("comment_count", 0),
+                        "media_type": m.get("media_type", 0),
+                        "taken_at": m.get("taken_at", 0),
+                        "thumbnail_url": "",
+                    })
+                    # Try to get thumbnail
+                    try:
+                        candidates = (m.get("image_versions2") or {}).get("candidates", [])
+                        if candidates:
+                            best = sorted(candidates, key=lambda c: c.get("height", 0) * c.get("width", 0))[-1]
+                            results[-1]["thumbnail_url"] = best.get("url", "")
+                    except Exception:
+                        pass
             return _to_json(results)
         except Exception as e:
             return f"[ERROR] Failed to fetch hashtag feed: {e}"
@@ -136,23 +182,43 @@ class InstagrapiBridge:
             return f"[ERROR] {e}"
 
     async def get_timeline_feed(self, amount: str = "20", **kwargs) -> str:
-        """Fetch posts from the authenticated user's timeline feed."""
+        """Fetch posts from the authenticated user's timeline feed.
+
+        Paginates automatically using next_max_id to pull up to `amount` posts.
+        """
         amount_int = int(amount) if str(amount).isdigit() else 20
+        max_pages = max(1, (amount_int + 11) // 12)  # ~12 items per page
         try:
-            medias = await self._run_async(self.cl.get_timeline_feed)
-            items = medias.get("feed_items", []) if isinstance(medias, dict) else []
-            # Also try the direct media list approach
-            if not items:
-                try:
-                    medias_list = await self._run_async(
-                        self.cl.get_timeline_feed
+            all_items = []
+            max_id = None
+            for page in range(max_pages):
+                if max_id:
+                    medias = await self._run_async(
+                        self.cl.get_timeline_feed, "pagination", max_id
                     )
-                    if isinstance(medias_list, list):
-                        items = medias_list[:amount_int]
-                except Exception:
-                    pass
+                else:
+                    medias = await self._run_async(self.cl.get_timeline_feed)
+
+                if not isinstance(medias, dict):
+                    break
+
+                items = medias.get("feed_items", [])
+                if not items:
+                    break
+                all_items.extend(items)
+
+                # Check for pagination cursor
+                next_max_id = medias.get("next_max_id")
+                more = medias.get("more_available", False)
+                if not next_max_id or not more or len(all_items) >= amount_int:
+                    break
+                max_id = next_max_id
+                # Small delay between pages to be gentle on the API
+                import time
+                await self._run_async(time.sleep, 1)
+
             results = []
-            for item in items[:amount_int]:
+            for item in all_items[:amount_int]:
                 media = item.get("media_or_ad", item) if isinstance(item, dict) else item
                 if isinstance(media, dict):
                     code = media.get("code", "")
@@ -173,6 +239,7 @@ class InstagrapiBridge:
                         "like_count": media.get("like_count", 0),
                         "has_liked": media.get("has_liked", False),
                         "media_type": "photo" if media_type == 1 else "video" if media_type == 2 else "carousel" if media_type == 8 else "unknown",
+                        "taken_at": media.get("taken_at", 0),
                         "thumbnail_url": thumbnail,
                         "video_url": video_url,
                     })
@@ -183,6 +250,8 @@ class InstagrapiBridge:
                         thumb = str(media.thumbnail_url) if getattr(media, "thumbnail_url", None) else ""
                         vid = str(media.video_url) if getattr(media, "video_url", None) else ""
                         mtype = getattr(media, "media_type", 0)
+                        ta = getattr(media, "taken_at", None)
+                        taken_at_ts = int(ta.timestamp()) if hasattr(ta, "timestamp") else (ta or 0)
                         results.append({
                             "id": str(media.pk),
                             "code": code,
@@ -192,6 +261,7 @@ class InstagrapiBridge:
                             "like_count": getattr(media, "like_count", 0),
                             "has_liked": getattr(media, "has_liked", False),
                             "media_type": "photo" if mtype == 1 else "video" if mtype == 2 else "carousel" if mtype == 8 else "unknown",
+                            "taken_at": taken_at_ts,
                             "thumbnail_url": thumb,
                             "video_url": vid,
                         })
@@ -358,54 +428,98 @@ class InstagrapiBridge:
         sent = self._load_dm_sent_ids()
         return _to_json({"count": len(sent), "dm_sent_ids": list(sent)})
 
+    def _build_profile_dict(self, data: dict) -> dict:
+        """Extract business-relevant fields from raw user data."""
+        profile = {
+            "user_id": str(data.get("pk", "")),
+            "username": data.get("username", ""),
+            "full_name": data.get("full_name", ""),
+            "biography": data.get("biography", ""),
+            "follower_count": data.get("follower_count", 0),
+            "following_count": data.get("following_count", 0),
+            "media_count": data.get("media_count", 0),
+            "is_business": data.get("is_business", False),
+            "is_private": data.get("is_private", False),
+            "is_verified": data.get("is_verified", False),
+            "category_name": data.get("category_name", ""),
+            "business_category_name": data.get("business_category_name", ""),
+            "contact_phone_number": data.get("contact_phone_number", ""),
+            "public_email": data.get("public_email", ""),
+            "public_phone_number": data.get("public_phone_number", ""),
+            "external_url": str(data.get("external_url", "") or ""),
+            "bio_links": [str(l) for l in (data.get("bio_links", []) or [])],
+        }
+        has_website = bool(profile["external_url"])
+        has_email = bool(profile["public_email"])
+        has_phone = bool(profile["public_phone_number"] or profile["contact_phone_number"])
+        profile["signals"] = {
+            "has_website": has_website,
+            "has_business_email": has_email,
+            "has_phone": has_phone,
+            "is_business_account": profile["is_business"],
+            "needs_website": profile["is_business"] and not has_website,
+            "needs_email": profile["is_business"] and not has_email,
+            "engagement_ratio": round(
+                (profile["follower_count"] / max(profile["media_count"], 1)), 1
+            ),
+        }
+        return profile
+
     async def get_business_profile(self, username: str = "", **kwargs) -> str:
         """Fetch an enriched profile with business signals for outreach qualification."""
         if not username:
             return "[ERROR] missing username"
         try:
-            user = await self._run_async(self.cl.user_info_by_username, username)
+            # Use private API directly — skip public GQL which always 429s
+            user = await self._run_async(self.cl.user_info_by_username_v1, username)
             data = getattr(user, "model_dump", user.dict)()
-
-            # Extract the business-relevant fields into a clean summary
-            profile = {
-                "user_id": str(data.get("pk", "")),
-                "username": data.get("username", ""),
-                "full_name": data.get("full_name", ""),
-                "biography": data.get("biography", ""),
-                "follower_count": data.get("follower_count", 0),
-                "following_count": data.get("following_count", 0),
-                "media_count": data.get("media_count", 0),
-                "is_business": data.get("is_business", False),
-                "is_private": data.get("is_private", False),
-                "is_verified": data.get("is_verified", False),
-                "category_name": data.get("category_name", ""),
-                "business_category_name": data.get("business_category_name", ""),
-                "contact_phone_number": data.get("contact_phone_number", ""),
-                "public_email": data.get("public_email", ""),
-                "public_phone_number": data.get("public_phone_number", ""),
-                "external_url": str(data.get("external_url", "") or ""),
-                "bio_links": [str(l) for l in (data.get("bio_links", []) or [])],
-            }
-
-            # Compute business signals
-            has_website = bool(profile["external_url"])
-            has_email = bool(profile["public_email"])
-            has_phone = bool(profile["public_phone_number"] or profile["contact_phone_number"])
-            profile["signals"] = {
-                "has_website": has_website,
-                "has_business_email": has_email,
-                "has_phone": has_phone,
-                "is_business_account": profile["is_business"],
-                "needs_website": profile["is_business"] and not has_website,
-                "needs_email": profile["is_business"] and not has_email,
-                "engagement_ratio": round(
-                    (profile["follower_count"] / max(profile["media_count"], 1)), 1
-                ),
-            }
-
-            return _to_json(profile)
+            return _to_json(self._build_profile_dict(data))
         except Exception as e:
             return f"[ERROR] Failed to fetch business profile: {e}"
+
+    # --- Follow ---
+
+    _FOLLOWED_FILE = "followed_users.json"
+
+    def _load_followed_ids(self) -> set:
+        try:
+            with open(self._FOLLOWED_FILE) as f:
+                data = json.load(f)
+                return set(str(i) for i in data)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return set()
+
+    def _save_followed_id(self, user_id: str):
+        followed = self._load_followed_ids()
+        followed.add(str(user_id))
+        with open(self._FOLLOWED_FILE, "w") as f:
+            json.dump(sorted(followed), f, indent=2)
+
+    async def follow_user(self, user_id: str = "", **kwargs) -> str:
+        """Follow a user by their numeric user ID. Dedup tracked."""
+        if not user_id:
+            return "[ERROR] missing user_id"
+        followed = self._load_followed_ids()
+        if user_id in followed:
+            return f"[SKIP] Already followed user {user_id}."
+        try:
+            result = await self._run_async(self.cl.user_follow, int(user_id))
+            if result:
+                self._save_followed_id(user_id)
+                return f"[SUCCESS] Followed user {user_id}."
+            else:
+                return f"[WARN] user_follow returned False for {user_id} (may already follow)."
+        except Exception as e:
+            err = str(e)
+            if "already" in err.lower():
+                self._save_followed_id(user_id)
+                return f"[SKIP] Already following user {user_id}."
+            return f"[ERROR] Failed to follow user {user_id}: {e}"
+
+    async def get_followed_users(self, **kwargs) -> str:
+        """Return list of user IDs we've followed via the bot."""
+        followed = self._load_followed_ids()
+        return _to_json({"count": len(followed), "followed_ids": list(followed)})
 
 
 def get_instagrapi_tools(bridge: InstagrapiBridge) -> list[ToolDef]:
@@ -497,5 +611,17 @@ def get_instagrapi_tools(bridge: InstagrapiBridge) -> list[ToolDef]:
             description="Fetch an enriched profile with business signals: is_business, has_website, has_email, needs_website, needs_email, engagement_ratio, category, etc.",
             parameters={"username": "Exact username to lookup (required)"},
             fn=bridge.get_business_profile,
+        ),
+        ToolDef(
+            name="ig_follow_user",
+            description="Follow a user by their numeric user ID. Automatically skips users already followed (tracked in followed_users.json).",
+            parameters={"user_id": "Numeric user ID (required)"},
+            fn=bridge.follow_user,
+        ),
+        ToolDef(
+            name="ig_get_followed_users",
+            description="Get the list of user IDs that have been followed via the bot (from local tracker).",
+            parameters={},
+            fn=bridge.get_followed_users,
         ),
     ]

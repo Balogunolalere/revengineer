@@ -384,54 +384,54 @@ class SecurityTools:
     def _register_all(self) -> None:
         """Register all supported tools."""
         tools = [
-            ToolSpec("nmap", ToolCategory.SCAN, config.nmap_path,
+            ToolSpec("nmap", ToolCategory.SCAN, self.config.nmap_path,
                      "Network mapper — port scanning and service detection",
                      safe=True, requires_root=True, parse_fn=parse_nmap_xml,
                      default_args=["-oX", "-"]),
 
-            ToolSpec("nuclei", ToolCategory.VULN, config.nuclei_path,
+            ToolSpec("nuclei", ToolCategory.VULN, self.config.nuclei_path,
                      "Fast vulnerability scanner with template-based detection",
                      safe=True, parse_fn=parse_nuclei_jsonl,
                      default_args=["-jsonl", "-silent"]),
 
-            ToolSpec("subfinder", ToolCategory.RECON, config.subfinder_path,
+            ToolSpec("subfinder", ToolCategory.RECON, self.config.subfinder_path,
                      "Passive subdomain enumeration",
                      safe=True, parse_fn=parse_subfinder_text,
                      default_args=["-silent"]),
 
-            ToolSpec("httpx", ToolCategory.ENUM, config.httpx_path,
+            ToolSpec("httpx", ToolCategory.ENUM, self.config.httpx_path,
                      "HTTP probing and technology detection",
                      safe=True, parse_fn=parse_httpx_jsonl,
                      default_args=["-json", "-silent"]),
 
-            ToolSpec("dig", ToolCategory.RECON, config.dig_path,
+            ToolSpec("dig", ToolCategory.RECON, self.config.dig_path,
                      "DNS query tool",
                      safe=True, parse_fn=parse_dig),
 
-            ToolSpec("whois", ToolCategory.RECON, config.whois_path,
+            ToolSpec("whois", ToolCategory.RECON, self.config.whois_path,
                      "Domain/IP WHOIS lookups",
                      safe=True, parse_fn=parse_whois),
 
-            ToolSpec("nikto", ToolCategory.VULN, config.nikto_path,
+            ToolSpec("nikto", ToolCategory.VULN, self.config.nikto_path,
                      "Web server vulnerability scanner",
                      safe=True, parse_fn=parse_nikto),
 
-            ToolSpec("whatweb", ToolCategory.ENUM, config.whatweb_path,
+            ToolSpec("whatweb", ToolCategory.ENUM, self.config.whatweb_path,
                      "Web technology fingerprinting",
                      safe=True, parse_fn=parse_whatweb,
                      default_args=["--log-json=-"]),
 
-            ToolSpec("ffuf", ToolCategory.ENUM, config.ffuf_path,
+            ToolSpec("ffuf", ToolCategory.ENUM, self.config.ffuf_path,
                      "Web fuzzer — directory and parameter brute-forcing",
                      safe=True, parse_fn=parse_ffuf_json,
                      default_args=["-of", "json", "-o", "-"]),
 
-            ToolSpec("testssl", ToolCategory.SCAN, config.testssl_path,
+            ToolSpec("testssl", ToolCategory.SCAN, self.config.testssl_path,
                      "TLS/SSL cipher and vulnerability analysis",
                      safe=True, parse_fn=parse_testssl,
                      default_args=["--jsonfile", "-"]),
 
-            ToolSpec("curl", ToolCategory.UTIL, config.curl_path,
+            ToolSpec("curl", ToolCategory.UTIL, self.config.curl_path,
                      "HTTP client for banner grabbing and API testing",
                      safe=True,
                      default_args=["-s", "-S", "-L", "-m", "30"]),
