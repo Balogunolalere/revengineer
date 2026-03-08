@@ -300,6 +300,17 @@ class InstagrapiBridge:
             if "already liked" in err.lower() or "has_liked" in err.lower():
                 self._save_liked_id(media_id)  # record it so we skip next time
                 return f"[SKIP] Post {media_id} was already liked."
+            # Detect rate-limit errors
+            is_rate_limit = (
+                "429" in err
+                or "403" in err
+                or "please wait" in err.lower()
+                or "try again" in err.lower()
+                or "feedback_required" in err.lower()
+                or "spam" in err.lower()
+            )
+            if is_rate_limit:
+                return f"[RATELIMIT] Like rate-limited for {media_id}: {e}"
             return f"[ERROR] Failed to like post {media_id}: {e}"
 
     async def get_liked_posts(self, **kwargs) -> str:
@@ -403,7 +414,11 @@ class InstagrapiBridge:
             json.dump(sorted(sent), f, indent=2)
 
     async def send_dm(self, user_id: str = "", text: str = "", **kwargs) -> str:
-        """Send a direct message to a user by their numeric user ID. Dedup tracked."""
+        """Send a direct message to a user by their numeric user ID. Dedup tracked.
+
+        Returns special [RATELIMIT] prefix when the failure is a 403/429
+        rate-limit response so callers can back off appropriately.
+        """
         if not user_id:
             return "[ERROR] missing user_id"
         if not text:
@@ -421,6 +436,19 @@ class InstagrapiBridge:
             else:
                 return f"[WARN] direct_send returned falsy for user {user_id}"
         except Exception as e:
+            err_str = str(e)
+            # Detect Instagram rate-limit / anti-spam blocks
+            is_rate_limit = (
+                "1404006" in err_str       # known DM rate-limit error code
+                or "403" in err_str
+                or "429" in err_str
+                or "please wait" in err_str.lower()
+                or "try again" in err_str.lower()
+                or "feedback_required" in err_str.lower()
+                or "spam" in err_str.lower()
+            )
+            if is_rate_limit:
+                return f"[RATELIMIT] DM rate-limited for user {user_id}: {e}"
             return f"[ERROR] Failed to DM user {user_id}: {e}"
 
     async def get_dm_sent(self, **kwargs) -> str:
